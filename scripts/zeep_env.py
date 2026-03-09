@@ -17,23 +17,18 @@ class ZeepkistEnv(gym.Env):
         self.input_port = input_port
         self.host = host
 
-        # Action Space: [Steering, Acceleration, Brake, Reset]
+        # Action Space: [Steering, Brake, ArmsUp, Reset]
+        # Steering: -1 to 1
+        # Brake: 0 to 1
+        # ArmsUp: 0 to 1
+        # Reset: 0 to 1
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, 0.0, 0.0]),
-            high=np.array([1.0, 1.0, 1.0, 1.0]),
+            low=np.array([-1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
 
-        # Observation Space:
-        # [0-2]   Position (Relative to world)
-        # [3-6]   Rotation (Quaternion)
-        # [7-9]   Velocity
-        # [10-12] AngularVelocity
-        # [13]    Speed
-        # [14-16] Relative vector to nearest ghost point
-        # [17-19] Relative velocity (Reserved)
-        # [20]    Progress (Normalized 0-1)
-        # [21]    Ghost Loaded (0 or 1)
+        # Observation Space: 22 dimensions
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -124,7 +119,7 @@ class ZeepkistEnv(gym.Env):
         self.last_ghost_index = 0
         
         print("Sending reset command to game...")
-        self._send_input(0.0, 0.0, False, True)
+        self._send_input(0.0, False, False, True)
         
         # 1. Wait for game to transition to NOT spawned
         print("Waiting for game to transition (IsSpawned -> False)...")
@@ -154,12 +149,11 @@ class ZeepkistEnv(gym.Env):
             
             if time.time() - start_wait > 10.0:
                 print("Spawn timeout, retrying reset...")
-                self._send_input(0.0, 0.0, False, True)
+                self._send_input(0.0, False, False, True)
                 time.sleep(0.5)
                 self._clear_telemetry_buffer()
                 start_wait = time.time()
 
-        # 3. CRITICAL: Wait a tiny bit more for physics to settle/camera to move
         time.sleep(0.2)
         self._receive_telemetry()
 
@@ -177,7 +171,7 @@ class ZeepkistEnv(gym.Env):
         ])
         
         search_range = 300
-        start_idx = max(0, self.last_ghost_index - 50) # Allow small backtrack
+        start_idx = max(0, self.last_ghost_index - 50) 
         end_idx = min(len(self.ghost_positions), self.last_ghost_index + search_range)
         
         if self.last_ghost_index == 0:
@@ -220,28 +214,25 @@ class ZeepkistEnv(gym.Env):
         return obs
 
     def _calculate_reward(self, obs):
-        # Progress-based reward
         reward = 0.0
         
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
-            reward += progress_gain * 1.0 # Significant reward for NEW progress
+            reward += progress_gain * 1.0 
             self.max_ghost_index = self.last_ghost_index
             
-        # Tiny speed bonus to keep moving
         reward += 0.01 * obs[13]
         
-        # Proximity bonus (Encourage staying on the ghost line)
         dist = np.linalg.norm(obs[14:17])
         reward += max(0, 1.0 - (dist / 10.0))
         
         return reward
 
-    def _send_input(self, steering, acceleration, brake, reset):
+    def _send_input(self, steering, brake, arms_up, reset):
         input_data = {
             "Steering": float(steering),
-            "Acceleration": float(acceleration),
             "Brake": bool(brake),
+            "ArmsUp": bool(arms_up),
             "Reset": bool(reset)
         }
         msg = json.dumps(input_data).encode('utf-8')
@@ -251,21 +242,18 @@ class ZeepkistEnv(gym.Env):
             pass
 
     def step(self, action):
+        # Action: [Steering, Brake, ArmsUp, Reset]
         steering = action[0]
-        acceleration = action[1]
-        brake = action[2] > 0.5
+        brake = action[1] > 0.5
+        arms_up = action[2] > 0.5
         reset = action[3] > 0.99
 
-        self._send_input(steering, acceleration, brake, reset)
+        self._send_input(steering, brake, arms_up, reset)
 
-        # 1. Wait for telemetry
         if not self._receive_telemetry():
-            # If mod is silent, treat as a tiny penalty but don't reset immediately
             return self._get_obs(), -0.1, False, False, {}
 
-        # 2. Check if player car is still valid
         if not self.last_telemetry.get('IsSpawned', False):
-            print("Player car lost (crashed/finished).")
             return self._get_obs(), -20.0, True, False, {}
 
         obs = self._get_obs()
@@ -274,16 +262,12 @@ class ZeepkistEnv(gym.Env):
         terminated = False
         truncated = False
         
-        # 3. Fell off world
         if obs[1] < -50: 
-            print("Fell off world.")
             reward -= 100.0
             terminated = True
             
-        # 4. Too far from ghost (completely lost)
         dist = np.linalg.norm(obs[14:17])
         if dist > 100.0 and self.ghost_positions is not None:
-            print("Too far from ghost.")
             reward -= 50.0
             terminated = True
 

@@ -1,9 +1,33 @@
+import sys
+import os
+import time
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from zeep_env import ZeepkistEnv
-import os
+
+class Logger(object):
+    def __init__(self, filename="zeepkist_training.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 def train():
+    # Redirect stdout and stderr to file + console
+    sys.stdout = Logger("zeepkist_training.log")
+    sys.stderr = sys.stdout
+
+    print("\n" + "="*50)
+    print(f"Training Session Started: {os.path.abspath('zeepkist_training.log')}")
+    print("="*50)
+
     # 1. Initialize the environment
     env = ZeepkistEnv()
 
@@ -15,10 +39,23 @@ def train():
         os.makedirs(checkpoint_dir)
 
     # 2. Define the model
+    model = None
     if os.path.exists(model_path + ".zip"):
-        print("Loading existing model...")
-        model = PPO.load(model_path, env=env)
-    else:
+        print("Attempting to load existing model...")
+        try:
+            model = PPO.load(model_path, env=env)
+            print("Model loaded successfully.")
+        except ValueError as e:
+            print(f"Observation/Action space mismatch: {e}")
+            backup_name = f"{model_path}_backup_{int(time.time())}.zip"
+            print(f"Backing up old model to {backup_name} and creating new model...")
+            os.rename(model_path + ".zip", backup_name)
+            model = None # Force creation of new model
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            model = None
+
+    if model is None:
         print("Creating new model...")
         model = PPO(
             "MlpPolicy", 
@@ -55,6 +92,10 @@ def train():
     except KeyboardInterrupt:
         print("Training interrupted. Saving current progress...")
         model.save(model_path)
+    except Exception as e:
+        print(f"An error occurred during training: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         env.close()
 

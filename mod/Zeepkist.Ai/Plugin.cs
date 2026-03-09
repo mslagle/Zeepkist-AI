@@ -93,15 +93,13 @@ namespace Zeepkist.Ai
         {
             if (!EnableAi.Value) return;
 
-            // Handle Reset globally
             if (CurrentInput != null && CurrentInput.Reset)
             {
                 if (PlayerManager.Instance != null && PlayerManager.Instance.currentMaster != null)
                 {
-                    Debug.Log("AI: Reset requested, restarting level.");
                     PlayerManager.Instance.currentMaster.RestartLevel();
                     CurrentInput.Reset = false; 
-                    playerCar = null; // Clear immediately so IsSpawned becomes false
+                    playerCar = null;
                 }
             }
 
@@ -113,7 +111,6 @@ namespace Zeepkist.Ai
             try
             {
                 object data;
-                // Double check if car is still valid/active
                 if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null)
                 {
                     data = new
@@ -157,28 +154,28 @@ namespace Zeepkist.Ai
                 {
                     if (playerCar != null && __instance == playerCar)
                     {
+                        // 1. Steering
                         if (__instance.SteerAction2 != null)
                             __instance.SteerAction2.axis = CurrentInput.Steering;
                         
-                        if (__instance.PitchForwardAction2 != null)
-                        {
-                            float accel = Mathf.Max(0, CurrentInput.Acceleration);
-                            __instance.PitchForwardAction2.axis = accel;
-                            __instance.PitchForwardAction2.buttonHeld = accel > 0.1f;
-                        }
-
+                        // 2. Braking (No acceleration in Zeepkist, only gravity)
                         if (__instance.BrakeAction2 != null)
                         {
                             __instance.BrakeAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f;
                             __instance.BrakeAction2.buttonHeld = CurrentInput.Brake;
                         }
-
+                        // Also apply to PitchBackward for ground-braking consistency
                         if (__instance.PitchBackwardAction2 != null)
                         {
-                            float reverse = Mathf.Max(0, -CurrentInput.Acceleration);
-                            if (CurrentInput.Brake) reverse = 1.0f;
-                            __instance.PitchBackwardAction2.axis = reverse;
-                            __instance.PitchBackwardAction2.buttonHeld = reverse > 0.1f;
+                            __instance.PitchBackwardAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f;
+                            __instance.PitchBackwardAction2.buttonHeld = CurrentInput.Brake;
+                        }
+
+                        // 3. Arms Up (Rights the car)
+                        if (__instance.ArmsUpAction2 != null)
+                        {
+                            __instance.ArmsUpAction2.axis = CurrentInput.ArmsUp ? 1.0f : 0.0f;
+                            __instance.ArmsUpAction2.buttonHeld = CurrentInput.ArmsUp;
                         }
                     }
                 }
@@ -190,8 +187,8 @@ namespace Zeepkist.Ai
     public class AiInput
     {
         public float Steering;
-        public float Acceleration;
         public bool Brake;
+        public bool ArmsUp;
         public bool Reset;
     }
 }
