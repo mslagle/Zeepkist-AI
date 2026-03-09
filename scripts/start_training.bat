@@ -25,8 +25,8 @@ call "%VENV_DIR%\Scripts\activate"
 
 :: 3. Install/Update requirements
 echo Installing/Updating requirements...
-:: Explicitly install setuptools for newer python versions
-pip install setuptools
+:: Force setuptools for TensorBoard compatibility
+pip install --upgrade setuptools pip
 pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo Error: Failed to install requirements.

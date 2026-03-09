@@ -397,3 +397,5 @@ FodyWeavers.xsd
 # JetBrains Rider
 *.sln.iml
 zeepkist_ai_model.zip
+zeepkist_logs/PPO_6/events.out.tfevents.1773087157.DESKTOP-T21R5IF.4348.0
+zeepkist_checkpoints/*.zip
