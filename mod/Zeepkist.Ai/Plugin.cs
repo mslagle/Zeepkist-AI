@@ -42,8 +42,11 @@ namespace Zeepkist.Ai
 
         private void Awake()
         {
+            Debug.Log("[AI_DEBUG] === Plugin.Awake() STARTING ===");
+            Harmony.DEBUG = true;
             harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
             harmony.PatchAll();
+            Debug.Log("[AI_DEBUG] === Harmony patches applied ===");
 
             EnableAi = Config.Bind<bool>("AI", "Enable AI control", false);
             ShowGhostPath = Config.Bind<bool>("Visuals", "Show GTR Ghost Path", true);
@@ -54,11 +57,14 @@ namespace Zeepkist.Ai
             SetupNetwork();
 
             RacingApi.PlayerSpawned += () => {
+                Debug.Log("[AI_DEBUG] RacingApi.PlayerSpawned Event Triggered");
                 playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
                 currentLevelHash = LevelApi.CurrentLevel?.UID ?? "Unknown";
+                Debug.Log($"[AI_DEBUG] Level Hash: {currentLevelHash}");
                 
                 if (visualizer == null)
                 {
+                    Debug.Log("[AI_DEBUG] Creating GhostVisualizer GameObject");
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
                     visualizer = vizObj.AddComponent<GhostVisualizer>();
                     visualizer.Initialize(PointsPort.Value);
@@ -66,11 +72,11 @@ namespace Zeepkist.Ai
                 visualizer.RefreshGhost(currentLevelHash);
             };
 
-            RacingApi.Crashed += (reason) => playerCar = null;
-            RacingApi.CrossedFinishLine += (time) => playerCar = null;
-            RacingApi.WheelBroken += () => playerCar = null;
+            RacingApi.Crashed += (reason) => { playerCar = null; Debug.Log("[AI_DEBUG] RacingApi.Crashed"); };
+            RacingApi.CrossedFinishLine += (time) => { playerCar = null; Debug.Log("[AI_DEBUG] RacingApi.CrossedFinishLine"); };
+            RacingApi.WheelBroken += () => { playerCar = null; Debug.Log("[AI_DEBUG] RacingApi.WheelBroken"); };
 
-            Debug.Log($"Plugin {MyPluginInfo.PLUGIN_GUID} is loaded!");
+            Debug.Log($"[AI_DEBUG] Plugin {MyPluginInfo.PLUGIN_GUID} fully initialized!");
         }
 
         private void SetupNetwork()
@@ -210,14 +216,15 @@ namespace Zeepkist.Ai
 
         public void Initialize(int port)
         {
+            Debug.Log($"[AI_DEBUG] Initializing Points Receiver on port {port}");
             try {
                 if (pointsServer != null) pointsServer.Close();
                 pointsServer = new UdpClient(port);
                 pointsEndPoint = new IPEndPoint(IPAddress.Any, port);
                 pointsServer.BeginReceive(new AsyncCallback(OnReceivePoints), null);
-                Debug.Log($"AI: Ghost Points receiver started on port {port}");
+                Debug.Log($"[AI_DEBUG] UDP Points Receiver successfully started on port {port}");
             } catch (Exception ex) {
-                Debug.LogError($"AI: Failed to start points receiver: {ex.Message}");
+                Debug.LogError($"[AI_DEBUG] CRITICAL: Failed to start points receiver: {ex.Message}");
             }
         }
 
@@ -226,78 +233,101 @@ namespace Zeepkist.Ai
             try {
                 byte[] bytes = pointsServer.EndReceive(res, ref pointsEndPoint);
                 string json = Encoding.UTF8.GetString(bytes);
+                Debug.Log($"[AI_DEBUG] Received UDP packet: {bytes.Length} bytes.");
                 
                 var wrapper = JsonConvert.DeserializeObject<PointsWrapper>(json);
                 if (wrapper != null && wrapper.Points != null) {
                     lock(receivedPoints) {
-                        // Offset Y by 2.0 meters to ensure it's above the track
-                        receivedPoints.AddRange(wrapper.Points.Select(p => new Vector3(p[0], p[1] + 2.0f, p[2])));
+                        int startCount = receivedPoints.Count;
+                        foreach (var p in wrapper.Points) {
+                            receivedPoints.Add(new Vector3(p[0], p[1] + 2.0f, p[2]));
+                        }
                         hasNewPoints = true;
+                        Debug.Log($"[AI_DEBUG] Parsed {wrapper.Points.Count} points. Total in queue: {receivedPoints.Count}");
+                        if (wrapper.Points.Count > 0) {
+                            var first = wrapper.Points[0];
+                            Debug.Log($"[AI_DEBUG] Sample point (raw): {first[0]}, {first[1]}, {first[2]}");
+                        }
                     }
+                } else {
+                    Debug.LogWarning("[AI_DEBUG] Received packet but Points wrapper was null or empty.");
                 }
             } catch (Exception ex) {
-                Debug.LogError($"AI: Error receiving/parsing points: {ex.Message}");
+                Debug.LogError($"[AI_DEBUG] Error in OnReceivePoints: {ex.Message}\n{ex.StackTrace}");
             }
 
             try {
                 pointsServer.BeginReceive(new AsyncCallback(OnReceivePoints), null);
-            } catch { }
+            } catch (Exception ex) {
+                Debug.LogError($"[AI_DEBUG] Error restarting BeginReceive: {ex.Message}");
+            }
         }
 
         private void Awake()
         {
+            Debug.Log("[AI_DEBUG] GhostVisualizer component is waking up...");
             line = gameObject.AddComponent<LineRenderer>();
             line.useWorldSpace = true;
-            line.startWidth = 2.0f; // Very thick
+            line.startWidth = 2.0f;
             line.endWidth = 2.0f;
             line.positionCount = 0;
             
-            // Use a very basic, bright material
-            line.material = new Material(Shader.Find("Hidden/Internal-CombinedDiffuse"));
-            if (line.material == null) line.material = new Material(Shader.Find("Sprites/Default"));
+            Shader shader = Shader.Find("Hidden/Internal-CombinedDiffuse");
+            if (shader == null) shader = Shader.Find("Sprites/Default");
+            Debug.Log($"[AI_DEBUG] Using shader: {shader?.name ?? "NULL"}");
             
-            line.startColor = Color.magenta; // Highly visible
+            line.material = new Material(shader);
+            line.startColor = Color.magenta;
             line.endColor = Color.magenta;
             line.sortingOrder = 10000;
             
-            Debug.Log("AI: GhostVisualizer initialized with Magenta 2.0 width.");
+            Debug.Log("[AI_DEBUG] GhostVisualizer LineRenderer configured.");
         }
 
         private void Update()
         {
             if (hasNewPoints) {
                 lock(receivedPoints) {
-                    Debug.Log($"AI: Updating LineRenderer with {receivedPoints.Count} points.");
+                    Debug.Log($"[AI_DEBUG] Update loop: Applying {receivedPoints.Count} points to LineRenderer.");
                     line.positionCount = receivedPoints.Count;
                     line.SetPositions(receivedPoints.ToArray());
                     hasNewPoints = false;
+                    Debug.Log("[AI_DEBUG] Update loop: LineRenderer positions updated.");
                 }
             }
         }
 
         public async void RefreshGhost(string levelHash)
         {
-            if (levelHash == lastHash || levelHash == "Unknown") return;
-            Debug.Log($"AI: Refreshing ghost for level {levelHash}");
+            Debug.Log($"[AI_DEBUG] RefreshGhost called for level: {levelHash}");
+            if (levelHash == lastHash || levelHash == "Unknown") {
+                Debug.Log($"[AI_DEBUG] Skipping refresh (Last: {lastHash}, New: {levelHash})");
+                return;
+            }
             lastHash = levelHash;
             
             lock(receivedPoints) {
                 line.positionCount = 0;
                 receivedPoints.Clear();
+                Debug.Log("[AI_DEBUG] Cleared old ghost points.");
             }
             
             Plugin.SetGhostUrl("");
 
             try
             {
+                Debug.Log("[AI_DEBUG] Fetching ghost URL via GraphQL...");
                 string ghostUrl = await FetchGhostUrl(levelHash);
                 if (!string.IsNullOrEmpty(ghostUrl)) {
+                    Debug.Log($"[AI_DEBUG] Found ghost URL: {ghostUrl}");
                     Plugin.SetGhostUrl(ghostUrl);
+                } else {
+                    Debug.LogWarning("[AI_DEBUG] GraphQL returned no ghost URL for this level.");
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Ghost Visualizer Error: {ex.Message}");
+                Debug.LogError($"[AI_DEBUG] RefreshGhost Exception: {ex.Message}");
             }
         }
 

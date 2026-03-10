@@ -22,70 +22,71 @@ class ZeepGhostParser:
                 data = lzma.decompress(raw_data, format=lzma.FORMAT_ALONE)
             except Exception as e:
                 print(f"LZMA Decompression failed: {e}")
-                # Fallback to raw if possible
                 data = raw_data
         else:
             data = raw_data
 
-        # 2. Parse Protobuf-like stream
-        # Each frame is a message containing Position (Tag 2) and Rotation (Tag 3)
-        # Position is 3x fixed32 (15 bytes delimited)
-        # Rotation is 4x fixed32 (20 bytes delimited)
+        # 2. Parse Protobuf
+        # The structure observed in hex:
+        # 0A [length] -> Start of Frame message
+        #   Inside frame:
+        #   0D [4 bytes] -> Position X (Tag 1, fixed32)
+        #   15 [4 bytes] -> Position Y (Tag 2, fixed32)
+        #   1D [4 bytes] -> Position Z (Tag 3, fixed32)
+        #   ... then rotation tags 4, 5, 6, 7
         
         self.frames = []
         i = 0
         total = len(data)
         
-        while i < total - 40:
-            # We look for the start of a frame. 
-            # In our observed data, Position is often Tag 2 (0x12) or Tag 1 (0x0A)
-            # and follows a specific length.
-            
-            # Let's search for the Vector3 pattern: 0D [4] 15 [4] 1D [4]
-            # This is Tag 1, 2, 3 of a nested message
-            
-            found_pos = False
-            if i + 15 < total and data[i] == 0x0D and data[i+5] == 0x15 and data[i+10] == 0x1D:
-                # Potential Vector3 (raw or inside message)
+        while i < total - 30:
+            # Look for Vector3 pattern: 0D [4] 15 [4] 1D [4]
+            # This is extremely reliable for finding floats in protobuf-net
+            if data[i] == 0x0D and data[i+5] == 0x15 and data[i+10] == 0x1D:
                 try:
                     px, py, pz = struct.unpack('<fff', data[i+1:i+5] + data[i+6:i+10] + data[i+11:i+15])
                     
-                    # Now look for Rotation nearby (Tag 3 usually follows)
-                    # We scan a small window for the Quaternion pattern: 0D [4] 15 [4] 1D [4] 25 [4]
-                    for j in range(i + 15, min(i + 60, total - 20)):
-                        if data[j] == 0x0D and data[j+5] == 0x15 and data[j+10] == 0x1D and data[j+15] == 0x25:
-                            rx, ry, rz, rw = struct.unpack('<ffff', data[j+1:j+5] + data[j+6:j+10] + data[j+11:j+15] + data[j+16:j+20])
-                            self.frames.append({
-                                'pos': (float(px), float(py), float(pz)),
-                                'rot': (float(rx), float(ry), float(rz), float(rw))
-                            })
-                            i = j + 20 # Advance to end of rotation
-                            found_pos = True
-                            break
+                    # Rotations follow (Tags 4, 5, 6, 7 -> 0x25, 0x2D, 0x35, 0x3D)
+                    # We look ahead slightly for these
+                    rx, ry, rz, rw = 0, 0, 0, 1
+                    found_rot = False
+                    for j in range(i + 15, i + 50):
+                        if j + 20 <= total:
+                            if data[j] == 0x25 and data[j+5] == 0x2D and data[j+10] == 0x35 and data[j+15] == 0x3D:
+                                rx, ry, rz, rw = struct.unpack('<ffff', data[j+1:j+5] + data[j+6:j+10] + data[j+11:j+15] + data[j+16:j+20])
+                                found_rot = True
+                                i = j + 20
+                                break
+                    
+                    # Only add if coordinates are somewhat reasonable (not near zero or infinite)
+                    if any(abs(v) > 0.001 for v in [px, py, pz]) and all(abs(v) < 100000 for v in [px, py, pz]):
+                        self.frames.append({
+                            'pos': (float(px), float(py), float(pz)),
+                            'rot': (float(rx), float(ry), float(rz), float(rw))
+                        })
+                        if not found_rot: i += 15
                 except:
-                    pass
-            
-            if not found_pos:
+                    i += 1
+            else:
                 i += 1
 
         if not self.frames:
-            print("WARNING: Protobuf parser found no frames. Falling back to raw float scan.")
+            print("WARNING: Protobuf parser found no valid frames. Falling back to raw float scan.")
             return self._fallback_parse(data)
 
         print(f"Successfully parsed {len(self.frames)} frames via Protobuf scanner.")
         return self.header, self.frames
 
     def _fallback_parse(self, data):
-        # Last resort: just find any sequence of 7 or 8 floats that look like a car
         self.frames = []
         i = 0
-        while i < len(data) - 32:
+        while i < len(data) - 28:
             try:
-                # Try 32-byte frame
-                f = struct.unpack('<ffffffff', data[i:i+32])
-                if -2000 < f[1] < 5000 and -2000 < f[2] < 5000 and -2000 < f[3] < 5000:
-                    self.frames.append({'pos': f[1:4], 'rot': f[4:8]})
-                    i += 32
+                # Try raw 7-float sequence
+                f = struct.unpack('<fffffff', data[i:i+28])
+                if all(abs(v) < 5000 for v in f[0:3]) and any(abs(v) > 1 for v in f[0:3]):
+                    self.frames.append({'pos': f[0:3], 'rot': f[3:7]})
+                    i += 28
                     continue
             except: pass
             i += 1
