@@ -25,8 +25,8 @@ call "%VENV_DIR%\Scripts\activate"
 
 :: 3. Install/Update requirements
 echo Installing/Updating requirements...
-:: Force setuptools for TensorBoard compatibility
-pip install --upgrade setuptools pip
+:: Force older setuptools (<70) for TensorBoard's pkg_resources compatibility
+pip install --upgrade "setuptools<70" pip grpcio tensorboard-data-server
 pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo Error: Failed to install requirements.

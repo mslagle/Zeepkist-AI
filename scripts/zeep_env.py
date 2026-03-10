@@ -81,10 +81,19 @@ class ZeepkistEnv(gym.Env):
         if os.path.exists(ghost_path):
             try:
                 parser = ZeepGhostParser(ghost_path)
-                _, self.ghost_frames = parser.parse()
+                header, self.ghost_frames = parser.parse()
                 if self.ghost_frames:
                     self.ghost_positions = np.array([f['pos'] for f in self.ghost_frames])
                     print(f"Loaded {len(self.ghost_frames)} frames for level {level_hash}")
+                    
+                    # Save to JSON for debugging
+                    json_path = ghost_path.replace(".zeepghost", ".json")
+                    with open(json_path, 'w') as jf:
+                        json.dump({
+                            'header': header,
+                            'frames': self.ghost_frames
+                        }, jf, indent=2)
+                    print(f"Saved ghost JSON to {json_path}")
                 else:
                     raise RuntimeError(f"Ghost file {ghost_path} parsed but contained no frames.")
             except Exception as e:
@@ -283,10 +292,14 @@ class ZeepkistEnv(gym.Env):
             reward -= 100.0
             terminated = True
             
-        # 2. Too far from ghost
+        # 2. Too far from ghost (Very forgiving early on)
         dist_2d = np.linalg.norm(obs[[14, 16]])
         if dist_2d > 300.0:
+            rel_vec = obs[14:17]
+            nearest_ghost_pos = obs[0:3] + rel_vec
             print(f"Terminating: Too far from track ({dist_2d:.1f}m)")
+            print(f"  Current Pos: ({obs[0]:.1f}, {obs[1]:.1f}, {obs[2]:.1f})")
+            print(f"  Ghost Pos:   ({nearest_ghost_pos[0]:.1f}, {nearest_ghost_pos[1]:.1f}, {nearest_ghost_pos[2]:.1f})")
             reward -= 50.0
             terminated = True
 

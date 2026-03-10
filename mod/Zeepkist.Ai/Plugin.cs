@@ -49,8 +49,13 @@ namespace Zeepkist.Ai
                 Debug.Log($"AI: Player spawned on level {currentLevelHash}");
             };
 
+            // Treat any of these as "run ended" which triggers reset in python
             RacingApi.Crashed += (reason) => playerCar = null;
             RacingApi.CrossedFinishLine += (time) => playerCar = null;
+            RacingApi.WheelBroken += () => {
+                Debug.Log("AI: Wheel broken, signaling reset.");
+                playerCar = null;
+            };
 
             Debug.Log($"Plugin {MyPluginInfo.PLUGIN_GUID} is loaded and networking is setup!");
         }
@@ -93,6 +98,7 @@ namespace Zeepkist.Ai
         {
             if (!EnableAi.Value) return;
 
+            // Handle Reset globally
             if (CurrentInput != null && CurrentInput.Reset)
             {
                 if (PlayerManager.Instance != null && PlayerManager.Instance.currentMaster != null)
@@ -158,13 +164,12 @@ namespace Zeepkist.Ai
                         if (__instance.SteerAction2 != null)
                             __instance.SteerAction2.axis = CurrentInput.Steering;
                         
-                        // 2. Braking (No acceleration in Zeepkist, only gravity)
+                        // 2. Braking
                         if (__instance.BrakeAction2 != null)
                         {
                             __instance.BrakeAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f;
                             __instance.BrakeAction2.buttonHeld = CurrentInput.Brake;
                         }
-                        // Also apply to PitchBackward for ground-braking consistency
                         if (__instance.PitchBackwardAction2 != null)
                         {
                             __instance.PitchBackwardAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f;

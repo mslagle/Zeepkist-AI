@@ -36,8 +36,8 @@ echo.
 :: Start browser after a small delay
 start "" http://localhost:6006
 
-:: Run TensorBoard using python -m to be more reliable
-python -m tensorboard.main --logdir "%LOG_DIR%" --port 6006
+:: Run TensorBoard using the direct exe from Scripts folder which is most reliable on Windows
+tensorboard --logdir "%LOG_DIR%" --port 6006
 
 :: If tensorboard exits
 if %errorlevel% neq 0 (

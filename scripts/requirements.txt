@@ -6,3 +6,5 @@ torch
 pandas
 setuptools
 pylzma
+grpcio
+tensorboard-data-server
