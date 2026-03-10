@@ -3,7 +3,7 @@ import os
 import time
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from zeep_env import ZeepkistEnv
 
@@ -21,25 +21,6 @@ class Logger(object):
         self.terminal.flush()
         self.log.flush()
 
-class TimedStoppingCallback(BaseCallback):
-    """
-    Callback that stops training after a certain amount of time.
-    """
-    def __init__(self, max_seconds: int, verbose=0):
-        super(TimedStoppingCallback, self).__init__(verbose)
-        self.max_seconds = max_seconds
-        self.start_time = None
-
-    def _on_training_start(self) -> None:
-        self.start_time = time.time()
-
-    def _on_step(self) -> bool:
-        if time.time() - self.start_time > self.max_seconds:
-            if self.verbose > 0:
-                print(f"Stopping training as max time of {self.max_seconds}s has been reached.")
-            return False
-        return True
-
 def make_env():
     return ZeepkistEnv()
 
@@ -47,15 +28,14 @@ def train():
     sys.stdout = Logger("zeepkist_training.log")
     sys.stderr = sys.stdout
 
-    # Constants for long-term training
-    HOURS = 12
-    MAX_SECONDS = HOURS * 3600
-    TOTAL_TIMESTEPS = 100_000_000 # High enough to let the timer decide
+    # Constants for indefinite training
+    TOTAL_TIMESTEPS = 1_000_000_000 # 1 Billion (Practically infinite)
     SAVE_FREQ = 50_000 # Save checkpoint every ~10-15 mins depending on FPS
 
     print("\n" + "="*50)
-    print(f"Long-term Training Session Started: {HOURS} hours goal")
-    print(f"Targeting end time: {time.ctime(time.time() + MAX_SECONDS)}")
+    print("Indefinite Training Session Started")
+    print(f"Model will save to ../zeepkist_ai_model every {SAVE_FREQ} steps.")
+    print("Press Ctrl+C in this window to stop training safely.")
     print("="*50)
 
     # 1. Initialize the environment with normalization
@@ -114,24 +94,21 @@ def train():
     checkpoint_callback = CheckpointCallback(
         save_freq=SAVE_FREQ,
         save_path=checkpoint_dir,
-        name_prefix="zeep_long_train"
+        name_prefix="zeep_continuous"
     )
-    
-    time_callback = TimedStoppingCallback(max_seconds=MAX_SECONDS, verbose=1)
 
     # 4. Start Learning
-    print(f"Starting learning loop. Model will save to {model_path} every {SAVE_FREQ} steps and on finish.")
     try:
         model.learn(
             total_timesteps=TOTAL_TIMESTEPS, 
             progress_bar=True,
-            callback=[checkpoint_callback, time_callback]
+            callback=[checkpoint_callback]
         )
-        print("Training finished normally.")
+        print("Training reached the total timestep limit.")
     except KeyboardInterrupt:
-        print("Training interrupted by user.")
+        print("\nTraining interrupted by user. Saving progress...")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"\nAn unexpected error occurred: {e}")
         import traceback
         traceback.print_exc()
     finally:
