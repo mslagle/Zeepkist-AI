@@ -46,7 +46,8 @@ class ZeepkistEnv(gym.Env):
         
         self.max_ghost_index = 0
         self.last_ghost_index = 0
-        self.last_move_time = time.time()
+        self.steps_in_episode = 0
+        self.stuck_start_time = None
         
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
@@ -108,7 +109,6 @@ class ZeepkistEnv(gym.Env):
             self.last_telemetry = json.loads(data.decode('utf-8'))
             
             if 'LevelHash' in self.last_telemetry:
-                # This will raise an exception if ghost is missing, stopping training
                 self._update_ghost_data(self.last_telemetry['LevelHash'])
                 
             return True
@@ -124,7 +124,8 @@ class ZeepkistEnv(gym.Env):
         
         self.max_ghost_index = 0
         self.last_ghost_index = 0
-        self.last_move_time = time.time()
+        self.steps_in_episode = 0
+        self.stuck_start_time = None
         
         print("--- ENVIRONMENT RESET ---")
         self._send_input(0.0, False, False, reset=True)
@@ -169,31 +170,29 @@ class ZeepkistEnv(gym.Env):
         return observation, {}
 
     def _get_nearest_ghost_info(self):
-        # We assume ghost_positions is NOT None because _update_ghost_data would have crashed otherwise
         pos = np.array([
             self.last_telemetry['Position']['x'],
             self.last_telemetry['Position']['y'],
             self.last_telemetry['Position']['z']
         ])
         
-        search_range = 500
-        start_idx = max(0, self.last_ghost_index - 100) 
+        search_range = 1000
+        start_idx = max(0, self.last_ghost_index - 200) 
         end_idx = min(len(self.ghost_positions), self.last_ghost_index + search_range)
         
-        if self.last_ghost_index == 0:
-            distances = np.linalg.norm(self.ghost_positions - pos, axis=1)
-            idx = np.argmin(distances)
+        subset = self.ghost_positions[start_idx:end_idx]
+        if len(subset) == 0:
+            idx = self.last_ghost_index
         else:
-            subset = self.ghost_positions[start_idx:end_idx]
-            if len(subset) == 0:
-                idx = self.last_ghost_index
-            else:
-                distances = np.linalg.norm(subset - pos, axis=1)
-                idx = np.argmin(distances) + start_idx
+            diffs = subset[:, [0, 2]] - pos[[0, 2]]
+            distances_sq = np.sum(diffs**2, axis=1)
+            idx = np.argmin(distances_sq) + start_idx
             
         self.last_ghost_index = idx
         relative_vec = self.ghost_positions[idx] - pos
-        progress = idx / len(self.ghost_positions)
+        
+        total_frames = len(self.ghost_positions)
+        progress = idx / total_frames if total_frames > 0 else 0.0
         
         return relative_vec, idx, progress
 
@@ -203,19 +202,23 @@ class ZeepkistEnv(gym.Env):
             return np.zeros(22, dtype=np.float32)
 
         rel_ghost_vec, _, progress = self._get_nearest_ghost_info()
-        ghost_loaded = 1.0 # Guaranteed if we reached here
+        ghost_loaded = 1.0
         
         obs = np.array([
-            t['Position']['x'], t['Position']['y'], t['Position']['z'],
+            t['Position']['x'] % 500, t['Position']['y'] % 500, t['Position']['z'] % 500,
             t['Rotation']['x'], t['Rotation']['y'], t['Rotation']['z'], t['Rotation']['w'],
             t['Velocity']['x'], t['Velocity']['y'], t['Velocity']['z'],
             t['AngularVelocity']['x'], t['AngularVelocity']['y'], t['AngularVelocity']['z'],
             t['Speed'],
             rel_ghost_vec[0], rel_ghost_vec[1], rel_ghost_vec[2],
-            0, 0, 0,
+            0, 0, 0, 
             progress,
             ghost_loaded
         ], dtype=np.float32)
+        
+        if not np.all(np.isfinite(obs)):
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+            
         return obs
 
     def _calculate_reward(self, obs):
@@ -225,16 +228,16 @@ class ZeepkistEnv(gym.Env):
         # 1. Progress Reward
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
-            reward += progress_gain * 2.0
+            reward += progress_gain * 5.0
             self.max_ghost_index = self.last_ghost_index
-            self.last_move_time = time.time()
             
         # 2. Speed bonus
-        reward += 0.01 * speed
+        if speed > 2.0:
+            reward += 0.1 * speed
         
         # 3. Proximity bonus
-        dist = np.linalg.norm(obs[14:17])
-        reward += max(0, 1.0 - (dist / 10.0))
+        dist_2d = np.linalg.norm(obs[[14, 16]])
+        reward += max(0, 5.0 - (dist_2d / 10.0))
         
         return reward
 
@@ -252,6 +255,8 @@ class ZeepkistEnv(gym.Env):
             pass
 
     def step(self, action):
+        self.steps_in_episode += 1
+        
         steering = action[0]
         brake = action[1] > 0.5
         arms_up = action[2] > 0.5
@@ -262,26 +267,42 @@ class ZeepkistEnv(gym.Env):
             return self._get_obs(), -0.1, False, False, {}
 
         if not self.last_telemetry.get('IsSpawned', False):
+            print("Terminating: IsSpawned is False")
             return self._get_obs(), -50.0, True, False, {}
 
         obs = self._get_obs()
         reward = self._calculate_reward(obs)
         
+        speed = obs[13]
         terminated = False
         truncated = False
         
+        # 1. Fell off world
         if obs[1] < -50: 
+            print("Terminating: Fell off world")
             reward -= 100.0
             terminated = True
             
-        dist = np.linalg.norm(obs[14:17])
-        if dist > 150.0:
+        # 2. Too far from ghost
+        dist_2d = np.linalg.norm(obs[[14, 16]])
+        if dist_2d > 300.0:
+            print(f"Terminating: Too far from track ({dist_2d:.1f}m)")
             reward -= 50.0
             terminated = True
 
-        if time.time() - self.last_move_time > 8.0:
-            reward -= 30.0
-            terminated = True
+        # 3. Stuck detection (Speed < 1.0 for 5 seconds)
+        if speed < 1.0:
+            if self.stuck_start_time is None:
+                self.stuck_start_time = time.time()
+            elif time.time() - self.stuck_start_time > 5.0:
+                print(f"Terminating: Stuck (speed {speed:.2f} < 1.0 for 5s)")
+                reward -= 30.0
+                terminated = True
+        else:
+            self.stuck_start_time = None
+            
+        if self.steps_in_episode > 10000:
+            truncated = True
 
         return obs, reward, terminated, truncated, {}
 

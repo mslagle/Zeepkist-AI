@@ -400,3 +400,4 @@ zeepkist_ai_model.zip
 zeepkist_logs/
 zeepkist_checkpoints/*.zip
 scripts/ghosts/
+zeepkist_vec_normalize.pkl

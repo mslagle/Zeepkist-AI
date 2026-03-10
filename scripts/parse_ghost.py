@@ -21,86 +21,95 @@ class ZeepGhostParser:
         with open(self.file_path, 'rb') as f:
             raw_data = f.read()
 
-        # Check for LZMA signature (5D 00 00 ...)
+        # Zeepkist GTR Ghost files usually start with LZMA (5D 00 00 01 00)
+        # 5 bytes properties, 8 bytes uncompressed size
         if raw_data.startswith(b'\x5d\x00\x00'):
             if not HAS_PYLZMA:
-                raise ImportError("Ghost file is compressed with LZMA. Please install 'pylzma' via pip.")
-            
-            print(f"Decompressing LZMA ghost: {self.file_path}")
-            try:
-                # LZMA format: 5 bytes properties, 8 bytes uncompressed size, then data
-                # We use pylzma.decompress which handles the stream
-                decompressed = pylzma.decompress(raw_data)
-                reader = io.BytesIO(decompressed)
-            except Exception as e:
-                print(f"LZMA Decompression failed: {e}")
-                # Fallback to direct read if it was a false positive signature
+                print("WARNING: pylzma not found, attempting direct parse (will likely fail)")
                 reader = io.BytesIO(raw_data)
+            else:
+                try:
+                    # pylzma.decompress expects the full 13-byte header
+                    decompressed = pylzma.decompress(raw_data)
+                    reader = io.BytesIO(decompressed)
+                except Exception as e:
+                    print(f"LZMA Decompression failed: {e}. Trying direct.")
+                    reader = io.BytesIO(raw_data)
         else:
             reader = io.BytesIO(raw_data)
 
-        try:
-            # 1. Version (int32)
-            self.header['version'] = struct.unpack('<i', reader.read(4))[0]
-            
-            # 2. Steam ID (int64)
-            self.header['steam_id'] = struct.unpack('<q', reader.read(8))[0]
+        # Frame structure: Vector3(3 floats) + Quaternion(4 floats) = 7 floats = 28 bytes
+        # Some versions might have 8 floats (including time)
+        
+        data = reader.read()
+        total_bytes = len(data)
+        
+        # We try to guess frame size based on common lengths
+        # 28 bytes = pos(12) + rot(16)
+        # 32 bytes = time(4) + pos(12) + rot(16)
+        
+        for frame_size in [28, 32]:
+            if total_bytes % frame_size == 0:
+                print(f"Detected potential frame size: {frame_size} bytes")
+                reader.seek(0)
+                self.frames = []
+                try:
+                    while True:
+                        buf = reader.read(frame_size)
+                        if len(buf) < frame_size: break
+                        
+                        if frame_size == 28:
+                            # pos(x,y,z), rot(x,y,z,w)
+                            f = struct.unpack('<fffffff', buf)
+                            self.frames.append({'pos': f[0:3], 'rot': f[3:7]})
+                        else:
+                            # time, pos(x,y,z), rot(x,y,z,w)
+                            f = struct.unpack('<ffffffff', buf)
+                            self.frames.append({'pos': f[1:4], 'rot': f[4:8]})
+                    
+                    if len(self.frames) > 10:
+                        print(f"Successfully parsed {len(self.frames)} frames.")
+                        return self.header, self.frames
+                except:
+                    continue
 
-            # 3. Username (C# string)
-            self.header['username'] = self._read_csharp_string(reader)
+        # If division didn't work, maybe there is a small header?
+        # Let's try skipping first few bytes (e.g. version int)
+        for offset in range(1, 16):
+            remaining = total_bytes - offset
+            for frame_size in [28, 32]:
+                if remaining > 0 and remaining % frame_size == 0:
+                    print(f"Found match at offset {offset} with frame size {frame_size}")
+                    reader.seek(offset)
+                    self.frames = []
+                    try:
+                        while True:
+                            buf = reader.read(frame_size)
+                            if len(buf) < frame_size: break
+                            if frame_size == 28:
+                                f = struct.unpack('<fffffff', buf)
+                                self.frames.append({'pos': f[0:3], 'rot': f[3:7]})
+                            else:
+                                f = struct.unpack('<ffffffff', buf)
+                                self.frames.append({'pos': f[1:4], 'rot': f[4:8]})
+                        return self.header, self.frames
+                    except:
+                        continue
 
-            # 4. Total Time (float32)
-            self.header['total_time'] = struct.unpack('<f', reader.read(4))[0]
-
-            # 5. Level Hash (C# string)
-            self.header['level_hash'] = self._read_csharp_string(reader)
-
-            # 6. Frame Count (int32)
-            frame_count = struct.unpack('<i', reader.read(4))[0]
-            self.header['frame_count'] = frame_count
-
-            # 7. Frames
-            for _ in range(frame_count):
-                # Position (3x float32)
-                px, py, pz = struct.unpack('<fff', reader.read(12))
-                # Rotation (4x float32)
-                rx, ry, rz, rw = struct.unpack('<ffff', reader.read(16))
-                
-                self.frames.append({
-                    'pos': (px, py, pz),
-                    'rot': (rx, ry, rz, rw)
-                })
-
-        except (struct.error, EOFError) as e:
-            print(f"Ghost parsing interrupted (possible version mismatch or corrupt file): {e}")
-            if not self.frames:
-                raise e
-
+        # Last resort: just try to read as many 28-byte chunks as possible
+        print("Last resort: reading 28-byte chunks until failure")
+        reader.seek(0)
+        self.frames = []
+        while True:
+            buf = reader.read(28)
+            if len(buf) < 28: break
+            try:
+                f = struct.unpack('<fffffff', buf)
+                self.frames.append({'pos': f[0:3], 'rot': f[3:7]})
+            except:
+                break
+        
         return self.header, self.frames
 
-    def _read_csharp_string(self, reader):
-        # Read 7-bit encoded integer (length)
-        length = 0
-        shift = 0
-        while True:
-            b = reader.read(1)
-            if not b:
-                raise EOFError("Unexpected end of stream while reading string length")
-            byte = struct.unpack('<B', b)[0]
-            length |= (byte & 0x7F) << shift
-            if (byte & 0x80) == 0:
-                break
-            shift += 7
-        
-        if length == 0:
-            return ""
-            
-        data = reader.read(length)
-        return data.decode('utf-8', errors='ignore')
-
 if __name__ == "__main__":
-    # Test
-    # parser = ZeepGhostParser("ghosts/ea1.zeepghost")
-    # h, f = parser.parse()
-    # print(f"Parsed {len(f)} frames")
     pass
