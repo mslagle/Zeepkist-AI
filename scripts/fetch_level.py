@@ -10,9 +10,7 @@ def get_level_by_hash(level_hash):
       levels(filter: { hash: { equalTo: $hash } }) {
         nodes {
           id
-          name
           hash
-          author
         }
       }
     }
@@ -20,7 +18,8 @@ def get_level_by_hash(level_hash):
     try:
         response = requests.post(GRAPHQL_URL, json={'query': query, 'variables': {'hash': level_hash}}, timeout=10)
         if response.status_code == 200:
-            nodes = response.json().get('data', {}).get('levels', {}).get('nodes', [])
+            data = response.json().get('data', {})
+            nodes = data.get('levels', {}).get('nodes', [])
             return nodes[0] if nodes else None
     except:
         pass
@@ -29,44 +28,16 @@ def get_level_by_hash(level_hash):
 def get_best_ghost_by_hash(level_hash):
     print(f"Searching for ghost with level hash: {level_hash}")
     
-    # Try searching for the best record directly
     query = """
     query GetBestGhost($hash: String!) {
-      records(
-        filter: { level: { hash: { equalTo: $hash } }, isValid: { equalTo: true } }
-        orderBy: TIME_ASC
-        first: 1
-      ) {
-        nodes {
-          id
-          time
-          ghostUrl
-        }
-      }
-    }
-    """
-    try:
-        response = requests.post(GRAPHQL_URL, json={'query': query, 'variables': {'hash': level_hash}}, timeout=10)
-        if response.status_code == 200:
-            data = response.json().get('data', {})
-            records = data.get('records', {}).get('nodes', [])
-            if records and records[0].get('ghostUrl'):
-                print(f"Found ghost via record search: {records[0]['ghostUrl']}")
-                return records[0]['ghostUrl']
-        else:
-            print(f"Direct record query failed: {response.status_code}")
-    except Exception as e:
-        print(f"Direct record query exception: {e}")
-
-    # Fallback: search via level
-    query_fallback = """
-    query GetLevelGhostFallback($hash: String!) {
       levels(filter: { hash: { equalTo: $hash } }) {
         nodes {
           id
-          records(filter: { isValid: { equalTo: true } }, orderBy: TIME_ASC, first: 1) {
+          records(orderBy: TIME_ASC, first: 1) {
             nodes {
-              ghostUrl
+              recordMedia {
+                ghostUrl
+              }
             }
           }
         }
@@ -74,23 +45,34 @@ def get_best_ghost_by_hash(level_hash):
     }
     """
     try:
-        response = requests.post(GRAPHQL_URL, json={'query': query_fallback, 'variables': {'hash': level_hash}}, timeout=10)
+        response = requests.post(GRAPHQL_URL, json={'query': query, 'variables': {'hash': level_hash}}, timeout=10)
         if response.status_code == 200:
-            data = response.json().get('data', {})
-            levels = data.get('levels', {}).get('nodes', [])
+            data = response.json()
+            levels = data.get('data', {}).get('levels', {}).get('nodes', [])
             if levels:
                 records = levels[0].get('records', {}).get('nodes', [])
-                if records and records[0].get('ghostUrl'):
-                    print(f"Found ghost via level fallback: {records[0]['ghostUrl']}")
-                    return records[0]['ghostUrl']
+                if records:
+                    media = records[0].get('recordMedia')
+                    if media and media.get('ghostUrl'):
+                        url = media.get('ghostUrl')
+                        print(f"Found ghost URL: {url}")
+                        return url
+            print(f"No records found for level {level_hash}")
+        else:
+            print(f"Query failed with code {response.status_code}")
     except Exception as e:
-        print(f"Fallback query exception: {e}")
+        print(f"Query exception: {e}")
 
     return None
 
 def download_file(url, output_path):
-    print(f"Downloading from: {url}")
+    if not url: return False
+    print(f"Downloading ghost from: {url}")
     try:
+        # Standardize URL
+        if url.startswith("//"):
+            url = "https:" + url
+        
         response = requests.get(url, timeout=30)
         if response.status_code == 200:
             with open(output_path, 'wb') as f:
@@ -103,6 +85,6 @@ def download_file(url, output_path):
     return False
 
 if __name__ == "__main__":
-    # Test
+    # Example Test
     # print(get_best_ghost_by_hash("ea1"))
     pass
