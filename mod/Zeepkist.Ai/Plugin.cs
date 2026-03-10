@@ -14,7 +14,6 @@ using Newtonsoft.Json;
 using System.Net.Http;
 using System.Threading.Tasks;
 using System.IO;
-using System.IO.Compression;
 
 namespace Zeepkist.Ai
 {
@@ -37,6 +36,7 @@ namespace Zeepkist.Ai
         public static AiInput CurrentInput { get; private set; } = new AiInput();
         private static New_ControlCar playerCar = null;
         private static string currentLevelHash = "Unknown";
+        private static string currentGhostUrl = "";
         private static GhostVisualizer visualizer = null;
 
         private void Awake()
@@ -56,15 +56,12 @@ namespace Zeepkist.Ai
                 currentLevelHash = LevelApi.CurrentLevel?.UID ?? "Unknown";
                 Debug.Log($"AI: Player spawned on level {currentLevelHash}");
 
-                if (ShowGhostPath.Value)
+                if (visualizer == null)
                 {
-                    if (visualizer == null)
-                    {
-                        GameObject vizObj = new GameObject("AI_GhostVisualizer");
-                        visualizer = vizObj.AddComponent<GhostVisualizer>();
-                    }
-                    visualizer.RefreshGhost(currentLevelHash);
+                    GameObject vizObj = new GameObject("AI_GhostVisualizer");
+                    visualizer = vizObj.AddComponent<GhostVisualizer>();
                 }
+                visualizer.RefreshGhost(currentLevelHash);
             };
 
             RacingApi.Crashed += (reason) => playerCar = null;
@@ -142,12 +139,13 @@ namespace Zeepkist.Ai
                         Speed = playerCar.rb.velocity.magnitude,
                         LocalGForce = new { x = playerCar.localGForce.x, y = playerCar.localGForce.y },
                         LevelHash = currentLevelHash,
+                        GhostUrl = currentGhostUrl,
                         IsSpawned = true
                     };
                 }
                 else
                 {
-                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash };
+                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash, GhostUrl = currentGhostUrl };
                 }
 
                 string json = JsonConvert.SerializeObject(data);
@@ -163,6 +161,11 @@ namespace Zeepkist.Ai
             inputServer?.Close();
             telemetryClient?.Close();
             if (visualizer != null) Destroy(visualizer.gameObject);
+        }
+
+        public static void SetGhostUrl(string url)
+        {
+            currentGhostUrl = url;
         }
 
         [HarmonyPatch(typeof(New_ControlCar), "Update")]
@@ -215,25 +218,24 @@ namespace Zeepkist.Ai
             if (levelHash == lastHash || levelHash == "Unknown") return;
             lastHash = levelHash;
             line.positionCount = 0;
+            Plugin.SetGhostUrl("");
 
             try
             {
                 string ghostUrl = await FetchGhostUrl(levelHash);
                 if (string.IsNullOrEmpty(ghostUrl)) return;
 
-                byte[] data = await client.GetByteArrayAsync(ghostUrl);
-                // We don't have LZMA in standard Unity/C# easily without extra libs,
-                // but since the python side has it, for the mod we will try to just
-                // download and if it's compressed, we might need a basic decoder.
-                // However, GTR ghosts are often LZMA. 
-                // For now, let's see if we can get basic uncompressed or wait for next iteration.
-                // Actually, let's just draw the line from the points if we can parse them.
-                
-                List<Vector3> points = ParseGhostPoints(data);
-                if (points.Count > 0)
+                Plugin.SetGhostUrl(ghostUrl);
+
+                if (Plugin.ShowGhostPath.Value)
                 {
-                    line.positionCount = points.Count;
-                    line.SetPositions(points.ToArray());
+                    byte[] data = await client.GetByteArrayAsync(ghostUrl);
+                    List<Vector3> points = ParseGhostPoints(data);
+                    if (points.Count > 0)
+                    {
+                        line.positionCount = points.Count;
+                        line.SetPositions(points.ToArray());
+                    }
                 }
             }
             catch (Exception ex)
@@ -244,28 +246,46 @@ namespace Zeepkist.Ai
 
         private async Task<string> FetchGhostUrl(string hash)
         {
-            string query = "{\"query\": \"query GetGhost($hash: String!) { levels(filter: { hash: { equalTo: $hash } }) { nodes { records(orderBy: TIME_ASC, first: 1) { nodes { recordMedia { ghostUrl } } } } } }\", \"variables\": { \"hash\": \"" + hash + "\" }}";
+            // Fetch top 10 records instead of just 1
+            string query = "{\"query\": \"query GetGhost($hash: String!) { levels(filter: { hash: { equalTo: $hash } }) { nodes { records(orderBy: TIME_ASC, first: 10) { nodes { recordMedia { ghostUrl } } } } } }\", \"variables\": { \"hash\": \"" + hash + "\" }}";
             var content = new StringContent(query, Encoding.UTF8, "application/json");
             var response = await client.PostAsync("https://graphql.zeepki.st", content);
             var json = await response.Content.ReadAsStringAsync();
             
-            // Minimal manual parsing to avoid more dependencies
-            int urlIndex = json.indexOf("\"ghostUrl\":\"");
-            if (urlIndex == -1) return null;
-            int start = urlIndex + 12;
-            int end = json.indexOf("\"", start);
-            return json.Substring(start, end - start);
+            // Collect all ghostUrls found
+            List<string> urls = new List<string>();
+            int currentPos = 0;
+            while (true)
+            {
+                int urlIndex = json.IndexOf("\"ghostUrl\":\"", currentPos);
+                if (urlIndex == -1) break;
+                int start = urlIndex + 12;
+                int end = json.IndexOf("\"", start);
+                string url = json.Substring(start, end - start);
+                if (url.StartsWith("//")) url = "https:" + url;
+                urls.Add(url);
+                currentPos = end;
+            }
+
+            if (urls.Count == 0) return null;
+
+            // Pick a "middle-ranked" ghost if possible (e.g. 5th to 10th)
+            // Fastest ghosts often use exploits or "weird tricks" that are bad for general AI training.
+            int indexToPick = 0; // Default to fastest if only 1
+            if (urls.Count >= 10) indexToPick = UnityEngine.Random.Range(4, 10); // 5th to 10th
+            else if (urls.Count >= 5) indexToPick = UnityEngine.Random.Range(2, urls.Count); // 3rd to last
+            else if (urls.Count > 1) indexToPick = urls.Count - 1; // Last one available
+
+            Debug.Log($"AI: Picking ghost rank {indexToPick + 1} of {urls.Count} for more 'natural' racing line.");
+            return urls[indexToPick];
         }
 
         private List<Vector3> ParseGhostPoints(byte[] data)
         {
             List<Vector3> points = new List<Vector3>();
-            // If data starts with LZMA header (0x5D), we currently can't decompress in-mod 
-            // without adding the LZMA SDK dll to the project references.
-            // For now, skip if compressed.
             if (data[0] == 0x5D) 
             {
-                Debug.LogWarning("Ghost is LZMA compressed, cannot visualize without LZMA SDK.");
+                // LZMA visualization skipped for now
                 return points;
             }
 
@@ -278,7 +298,7 @@ namespace Zeepkist.Ai
                         float y = reader.ReadSingle();
                         float z = reader.ReadSingle();
                         points.Add(new Vector3(x, y, z));
-                        ms.Seek(16, SeekOrigin.Current); // Skip rotation (4 floats)
+                        ms.Seek(16, SeekOrigin.Current); 
                     }
                 } catch { }
             }

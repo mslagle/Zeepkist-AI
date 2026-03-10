@@ -8,7 +8,7 @@ import time
 import os
 import sys
 from parse_ghost import ZeepGhostParser
-from fetch_level import get_best_ghost_by_hash, download_file
+from fetch_level import download_file
 
 class ZeepkistEnv(gym.Env):
     def __init__(self, telemetry_port=9090, input_port=9091, host='127.0.0.1'):
@@ -18,14 +18,12 @@ class ZeepkistEnv(gym.Env):
         self.input_port = input_port
         self.host = host
 
-        # Action Space: [Steering, Brake, ArmsUp]
         self.action_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
             high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
 
-        # Observation Space: 22 dimensions
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -41,6 +39,7 @@ class ZeepkistEnv(gym.Env):
         
         self.last_telemetry = None
         self.current_level_hash = None
+        self.current_ghost_url = None
         self.ghost_frames = None
         self.ghost_positions = None
         
@@ -52,33 +51,25 @@ class ZeepkistEnv(gym.Env):
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
 
-    def _update_ghost_data(self, level_hash):
-        if level_hash == self.current_level_hash and self.ghost_positions is not None:
+    def _update_ghost_data(self, level_hash, ghost_url):
+        # We trigger update if hash OR url changes
+        if level_hash == self.current_level_hash and ghost_url == self.current_ghost_url and self.ghost_positions is not None:
             return
         
-        print(f"Detected level hash: {level_hash}")
+        if not ghost_url:
+            return # Wait until mod provides a URL
+
+        print(f"New ghost discovered: {ghost_url} (Level: {level_hash})")
         self.current_level_hash = level_hash
+        self.current_ghost_url = ghost_url
         self.ghost_frames = None
         self.ghost_positions = None
         
         ghost_path = f"ghosts/{level_hash}.zeepghost"
         
-        if not os.path.exists(ghost_path):
-            print(f"Ghost not found locally for {level_hash}. Fetching from API...")
-            try:
-                ghost_url = get_best_ghost_by_hash(level_hash)
-                if ghost_url:
-                    if download_file(ghost_url, ghost_path):
-                        print(f"Ghost downloaded successfully: {ghost_path}")
-                    else:
-                        raise RuntimeError(f"Failed to download ghost from {ghost_url}")
-                else:
-                    raise RuntimeError(f"No ghost record found for level hash {level_hash} in GTR API. Ghost is REQUIRED for training.")
-            except Exception as e:
-                print(f"CRITICAL ERROR fetching ghost: {e}")
-                raise e
-
-        if os.path.exists(ghost_path):
+        # Download if we don't have it or if URL changed
+        print(f"Downloading ghost from mod-provided URL...")
+        if download_file(ghost_url, ghost_path):
             try:
                 parser = ZeepGhostParser(ghost_path)
                 header, self.ghost_frames = parser.parse()
@@ -86,21 +77,17 @@ class ZeepkistEnv(gym.Env):
                     self.ghost_positions = np.array([f['pos'] for f in self.ghost_frames])
                     print(f"Loaded {len(self.ghost_frames)} frames for level {level_hash}")
                     
-                    # Save to JSON for debugging
+                    # Save JSON for analysis
                     json_path = ghost_path.replace(".zeepghost", ".json")
                     with open(json_path, 'w') as jf:
-                        json.dump({
-                            'header': header,
-                            'frames': self.ghost_frames
-                        }, jf, indent=2)
-                    print(f"Saved ghost JSON to {json_path}")
+                        json.dump({'header': header, 'frames': self.ghost_frames}, jf, indent=2)
                 else:
-                    raise RuntimeError(f"Ghost file {ghost_path} parsed but contained no frames.")
+                    raise RuntimeError("Ghost parsed but empty")
             except Exception as e:
-                print(f"CRITICAL ERROR parsing ghost file: {e}")
+                print(f"CRITICAL ERROR parsing ghost: {e}")
                 raise e
         else:
-            raise RuntimeError(f"Ghost file {ghost_path} does not exist and could not be downloaded.")
+            raise RuntimeError(f"Failed to download ghost from {ghost_url}")
 
     def _clear_telemetry_buffer(self):
         original_timeout = self.telemetry_socket.gettimeout()
@@ -117,8 +104,11 @@ class ZeepkistEnv(gym.Env):
             data, addr = self.telemetry_socket.recvfrom(8192)
             self.last_telemetry = json.loads(data.decode('utf-8'))
             
-            if 'LevelHash' in self.last_telemetry:
-                self._update_ghost_data(self.last_telemetry['LevelHash'])
+            level_hash = self.last_telemetry.get('LevelHash')
+            ghost_url = self.last_telemetry.get('GhostUrl')
+            
+            if level_hash and ghost_url:
+                self._update_ghost_data(level_hash, ghost_url)
                 
             return True
         except socket.timeout:
@@ -130,7 +120,6 @@ class ZeepkistEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
         self.max_ghost_index = 0
         self.last_ghost_index = 0
         self.steps_in_episode = 0
@@ -139,7 +128,6 @@ class ZeepkistEnv(gym.Env):
         print("--- ENVIRONMENT RESET ---")
         self._send_input(0.0, False, False, reset=True)
         
-        # 1. Wait for game to transition to NOT spawned
         start_wait = time.time()
         while time.time() - start_wait < 3.0:
             if self._receive_telemetry():
@@ -149,22 +137,23 @@ class ZeepkistEnv(gym.Env):
 
         self._clear_telemetry_buffer()
 
-        # 2. Wait for game to signal that the player is spawned
+        print("Waiting for player to spawn and ghost data to load...")
         spawned = False
         start_wait = time.time()
         
         while not spawned:
             self._send_input(0.0, False, False, reset=False)
             if self._receive_telemetry():
-                if self.last_telemetry.get('IsSpawned', False) and 'Position' in self.last_telemetry:
+                # We also REQUIRE ghost data to be loaded before starting
+                if self.last_telemetry.get('IsSpawned', False) and 'Position' in self.last_telemetry and self.ghost_positions is not None:
                     spawned = True
-                    print("Player spawned!")
+                    print("Ready! Player spawned and ghost loaded.")
             
             if not spawned:
                 time.sleep(0.1)
             
-            if time.time() - start_wait > 10.0:
-                print("Spawn timeout, retrying reset...")
+            if time.time() - start_wait > 15.0: # Longer timeout for ghost fetching
+                print("Spawn/Ghost timeout, retrying...")
                 self._send_input(0.0, False, False, reset=True)
                 time.sleep(0.5)
                 self._clear_telemetry_buffer()
@@ -175,8 +164,7 @@ class ZeepkistEnv(gym.Env):
         while not self._receive_telemetry():
             time.sleep(0.1)
 
-        observation = self._get_obs()
-        return observation, {}
+        return self._get_obs(), {}
 
     def _get_nearest_ghost_info(self):
         pos = np.array([
@@ -199,9 +187,7 @@ class ZeepkistEnv(gym.Env):
             
         self.last_ghost_index = idx
         relative_vec = self.ghost_positions[idx] - pos
-        
-        total_frames = len(self.ghost_positions)
-        progress = idx / total_frames if total_frames > 0 else 0.0
+        progress = idx / len(self.ghost_positions)
         
         return relative_vec, idx, progress
 
@@ -233,90 +219,48 @@ class ZeepkistEnv(gym.Env):
     def _calculate_reward(self, obs):
         reward = 0.0
         speed = obs[13]
-        
-        # 1. Progress Reward
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
             reward += progress_gain * 5.0
             self.max_ghost_index = self.last_ghost_index
-            
-        # 2. Speed bonus
         if speed > 2.0:
             reward += 0.1 * speed
-        
-        # 3. Proximity bonus
         dist_2d = np.linalg.norm(obs[[14, 16]])
         reward += max(0, 5.0 - (dist_2d / 10.0))
-        
         return reward
 
     def _send_input(self, steering, brake, arms_up, reset=False):
-        input_data = {
-            "Steering": float(steering),
-            "Brake": bool(brake),
-            "ArmsUp": bool(arms_up),
-            "Reset": bool(reset)
-        }
+        input_data = {"Steering": float(steering), "Brake": bool(brake), "ArmsUp": bool(arms_up), "Reset": bool(reset)}
         msg = json.dumps(input_data).encode('utf-8')
-        try:
-            self.input_socket.sendto(msg, (self.host, self.input_port))
-        except:
-            pass
+        try: self.input_socket.sendto(msg, (self.host, self.input_port))
+        except: pass
 
     def step(self, action):
         self.steps_in_episode += 1
-        
-        steering = action[0]
-        brake = action[1] > 0.5
-        arms_up = action[2] > 0.5
-
-        self._send_input(steering, brake, arms_up, reset=False)
+        self._send_input(action[0], action[1] > 0.5, action[2] > 0.5, reset=False)
 
         if not self._receive_telemetry():
             return self._get_obs(), -0.1, False, False, {}
 
         if not self.last_telemetry.get('IsSpawned', False):
-            print("Terminating: IsSpawned is False")
             return self._get_obs(), -50.0, True, False, {}
 
         obs = self._get_obs()
         reward = self._calculate_reward(obs)
-        
         speed = obs[13]
         terminated = False
         truncated = False
         
-        # 1. Fell off world
-        if obs[1] < -50: 
-            print("Terminating: Fell off world")
-            reward -= 100.0
-            terminated = True
-            
-        # 2. Too far from ghost (Very forgiving early on)
+        if obs[1] < -50: terminated = True; reward -= 100.0
         dist_2d = np.linalg.norm(obs[[14, 16]])
-        if dist_2d > 300.0:
-            rel_vec = obs[14:17]
-            nearest_ghost_pos = obs[0:3] + rel_vec
-            print(f"Terminating: Too far from track ({dist_2d:.1f}m)")
-            print(f"  Current Pos: ({obs[0]:.1f}, {obs[1]:.1f}, {obs[2]:.1f})")
-            print(f"  Ghost Pos:   ({nearest_ghost_pos[0]:.1f}, {nearest_ghost_pos[1]:.1f}, {nearest_ghost_pos[2]:.1f})")
-            reward -= 50.0
-            terminated = True
+        if dist_2d > 300.0: terminated = True; reward -= 50.0
 
-        # 3. Stuck detection (Speed < 1.0 for 5 seconds)
         if speed < 1.0:
-            if self.stuck_start_time is None:
-                self.stuck_start_time = time.time()
-            elif time.time() - self.stuck_start_time > 5.0:
-                print(f"Terminating: Stuck (speed {speed:.2f} < 1.0 for 5s)")
-                reward -= 30.0
-                terminated = True
-        else:
-            self.stuck_start_time = None
+            if self.stuck_start_time is None: self.stuck_start_time = time.time()
+            elif time.time() - self.stuck_start_time > 5.0: terminated = True; reward -= 30.0
+        else: self.stuck_start_time = None
             
-        if self.steps_in_episode > 10000:
-            truncated = True
-
+        if self.steps_in_episode > 10000: truncated = True
         return obs, reward, terminated, truncated, {}
 
     def close(self):
