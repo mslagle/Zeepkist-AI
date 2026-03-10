@@ -2,6 +2,8 @@ import struct
 import io
 import os
 import lzma
+import gzip
+import numpy as np
 
 class ZeepGhostParser:
     def __init__(self, file_path):
@@ -16,81 +18,91 @@ class ZeepGhostParser:
         with open(self.file_path, 'rb') as f:
             raw_data = f.read()
 
-        # 1. Decompress LZMA
+        # 1. Detect and Decompress
+        data = None
+        # Try LZMA (Zeepkist standard)
         if raw_data.startswith(b'\x5d\x00\x00'):
             try:
                 data = lzma.decompress(raw_data, format=lzma.FORMAT_ALONE)
-            except Exception as e:
-                print(f"LZMA Decompression failed: {e}")
-                data = raw_data
-        else:
+                print(f"Decompressed LZMA: {len(data)} bytes")
+            except: pass
+        
+        # Try GZIP (Fallback based on GhostReaderFactory)
+        if data is None and raw_data.startswith(b'\x1f\x8b'):
+            try:
+                data = gzip.decompress(raw_data)
+                print(f"Decompressed GZIP: {len(data)} bytes")
+            except: pass
+            
+        # Fallback to raw if no compression detected or decompression failed
+        if data is None:
             data = raw_data
+            print(f"Using raw data: {len(data)} bytes")
 
-        # 2. Parse Protobuf
-        # The structure observed in hex:
-        # 0A [length] -> Start of Frame message
-        #   Inside frame:
-        #   0D [4 bytes] -> Position X (Tag 1, fixed32)
-        #   15 [4 bytes] -> Position Y (Tag 2, fixed32)
-        #   1D [4 bytes] -> Position Z (Tag 3, fixed32)
-        #   ... then rotation tags 4, 5, 6, 7
+        # 2. Advanced Brute-Force Telemetry Scanner
+        # We search for ANY sequence of 7 or 8 floats that look like a car.
+        # This bypasses all Protobuf tags and metadata reliably.
         
         self.frames = []
-        i = 0
         total = len(data)
         
-        while i < total - 30:
-            # Look for Vector3 pattern: 0D [4] 15 [4] 1D [4]
-            # This is extremely reliable for finding floats in protobuf-net
-            if data[i] == 0x0D and data[i+5] == 0x15 and data[i+10] == 0x1D:
-                try:
-                    px, py, pz = struct.unpack('<fff', data[i+1:i+5] + data[i+6:i+10] + data[i+11:i+15])
-                    
-                    # Rotations follow (Tags 4, 5, 6, 7 -> 0x25, 0x2D, 0x35, 0x3D)
-                    # We look ahead slightly for these
-                    rx, ry, rz, rw = 0, 0, 0, 1
-                    found_rot = False
-                    for j in range(i + 15, i + 50):
-                        if j + 20 <= total:
-                            if data[j] == 0x25 and data[j+5] == 0x2D and data[j+10] == 0x35 and data[j+15] == 0x3D:
-                                rx, ry, rz, rw = struct.unpack('<ffff', data[j+1:j+5] + data[j+6:j+10] + data[j+11:j+15] + data[j+16:j+20])
-                                found_rot = True
-                                i = j + 20
-                                break
-                    
-                    # Only add if coordinates are somewhat reasonable (not near zero or infinite)
-                    if any(abs(v) > 0.001 for v in [px, py, pz]) and all(abs(v) < 100000 for v in [px, py, pz]):
-                        self.frames.append({
-                            'pos': (float(px), float(py), float(pz)),
-                            'rot': (float(rx), float(ry), float(rz), float(rw))
-                        })
-                        if not found_rot: i += 15
-                except:
-                    i += 1
-            else:
-                i += 1
-
-        if not self.frames:
-            print("WARNING: Protobuf parser found no valid frames. Falling back to raw float scan.")
-            return self._fallback_parse(data)
-
-        print(f"Successfully parsed {len(self.frames)} frames via Protobuf scanner.")
-        return self.header, self.frames
-
-    def _fallback_parse(self, data):
-        self.frames = []
+        # Scan every single byte offset for maximum reliability
+        print("Brute-forcing float sequences...")
+        
         i = 0
-        while i < len(data) - 28:
+        while i < total - 32:
             try:
-                # Try raw 7-float sequence
-                f = struct.unpack('<fffffff', data[i:i+28])
-                if all(abs(v) < 5000 for v in f[0:3]) and any(abs(v) > 1 for v in f[0:3]):
-                    self.frames.append({'pos': f[0:3], 'rot': f[3:7]})
+                # Try 32-byte (Time, Pos, Rot)
+                f8 = struct.unpack('<ffffffff', data[i:i+32])
+                # Heuristics:
+                # 1. Normalized rotation (indices 4-8)
+                # 2. Reasonable coordinates (indices 1-4)
+                # 3. Small positive time (index 0)
+                if (0 <= f8[0] < 3600 and 
+                    all(-5000 < x < 5000 for x in f8[1:4]) and 
+                    0.99 < (f8[4]**2 + f8[5]**2 + f8[6]**2 + f8[7]**2) < 1.01):
+                    
+                    self.frames.append({'pos': f8[1:4], 'rot': f8[4:8]})
+                    i += 32 
+                    continue
+
+                # Try 28-byte (Pos, Rot)
+                f7 = struct.unpack('<fffffff', data[i:i+28])
+                if (all(-5000 < x < 5000 for x in f7[0:3]) and 
+                    0.99 < (f7[3]**2 + f7[4]**2 + f7[5]**2 + f7[6]**2) < 1.01):
+                    
+                    self.frames.append({'pos': f7[0:3], 'rot': f7[3:7]})
                     i += 28
                     continue
             except: pass
             i += 1
+
+        # Deduplicate results from overlapping windows
+        if self.frames:
+            unique = []
+            unique.append(self.frames[0])
+            for f in self.frames[1:]:
+                # Only add if car has moved significantly or rotation changed
+                dist = np.linalg.norm(np.array(f['pos']) - np.array(unique[-1]['pos']))
+                if dist > 0.01:
+                    unique.append(f)
+            self.frames = unique
+
+        print(f"Successfully parsed {len(self.frames)} frames.")
         return self.header, self.frames
 
 if __name__ == "__main__":
-    pass
+    import sys
+    test_file = "ghosts/ea1.zeepghost"
+    if len(sys.argv) > 1:
+        test_file = sys.argv[1]
+    
+    if os.path.exists(test_file):
+        print(f"Testing parser on {test_file}...")
+        parser = ZeepGhostParser(test_file)
+        h, f = parser.parse()
+        if f:
+            print(f"First frame pos: {f[0]['pos']}")
+            print(f"Last frame pos: {f[-1]['pos']}")
+        else:
+            print("Failed to extract frames.")

@@ -14,6 +14,8 @@ using Newtonsoft.Json;
 using System.Net.Http;
 using System.Threading.Tasks;
 using System.IO;
+using ProtoBuf;
+using EasyCompressor;
 
 namespace Zeepkist.Ai
 {
@@ -33,20 +35,18 @@ namespace Zeepkist.Ai
         private static IPEndPoint telemetryEndPoint;
         private static UdpClient inputServer;
         private static IPEndPoint inputEndPoint;
+        private static UdpClient pointsClient;
+        private static IPEndPoint pointsEndPoint;
 
         public static AiInput CurrentInput { get; private set; } = new AiInput();
         private static New_ControlCar playerCar = null;
         private static string currentLevelHash = "Unknown";
-        private static string currentGhostUrl = "";
         private static GhostVisualizer visualizer = null;
 
         private void Awake()
         {
-            Debug.Log("[AI_DEBUG] === Plugin.Awake() STARTING ===");
-            Harmony.DEBUG = true;
             harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
             harmony.PatchAll();
-            Debug.Log("[AI_DEBUG] === Harmony patches applied ===");
 
             EnableAi = Config.Bind<bool>("AI", "Enable AI control", false);
             ShowGhostPath = Config.Bind<bool>("Visuals", "Show GTR Ghost Path", true);
@@ -57,26 +57,22 @@ namespace Zeepkist.Ai
             SetupNetwork();
 
             RacingApi.PlayerSpawned += () => {
-                Debug.Log("[AI_DEBUG] RacingApi.PlayerSpawned Event Triggered");
                 playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
                 currentLevelHash = LevelApi.CurrentLevel?.UID ?? "Unknown";
-                Debug.Log($"[AI_DEBUG] Level Hash: {currentLevelHash}");
                 
                 if (visualizer == null)
                 {
-                    Debug.Log("[AI_DEBUG] Creating GhostVisualizer GameObject");
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
                     visualizer = vizObj.AddComponent<GhostVisualizer>();
-                    visualizer.Initialize(PointsPort.Value);
                 }
                 visualizer.RefreshGhost(currentLevelHash);
             };
 
-            RacingApi.Crashed += (reason) => { playerCar = null; Debug.Log("[AI_DEBUG] RacingApi.Crashed"); };
-            RacingApi.CrossedFinishLine += (time) => { playerCar = null; Debug.Log("[AI_DEBUG] RacingApi.CrossedFinishLine"); };
-            RacingApi.WheelBroken += () => { playerCar = null; Debug.Log("[AI_DEBUG] RacingApi.WheelBroken"); };
+            RacingApi.Crashed += (reason) => { playerCar = null; };
+            RacingApi.CrossedFinishLine += (time) => { playerCar = null; };
+            RacingApi.WheelBroken += () => { playerCar = null; };
 
-            Debug.Log($"[AI_DEBUG] Plugin {MyPluginInfo.PLUGIN_GUID} fully initialized!");
+            Debug.Log($"Plugin {MyPluginInfo.PLUGIN_GUID} loaded!");
         }
 
         private void SetupNetwork()
@@ -89,6 +85,9 @@ namespace Zeepkist.Ai
                 inputServer = new UdpClient(InputPort.Value);
                 inputEndPoint = new IPEndPoint(IPAddress.Any, InputPort.Value);
                 inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null);
+
+                pointsClient = new UdpClient();
+                pointsEndPoint = new IPEndPoint(IPAddress.Parse("127.0.0.1"), PointsPort.Value);
             }
             catch (Exception ex)
             {
@@ -147,13 +146,12 @@ namespace Zeepkist.Ai
                         Speed = playerCar.rb.velocity.magnitude,
                         LocalGForce = new { x = playerCar.localGForce.x, y = playerCar.localGForce.y },
                         LevelHash = currentLevelHash,
-                        GhostUrl = currentGhostUrl,
                         IsSpawned = true
                     };
                 }
                 else
                 {
-                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash, GhostUrl = currentGhostUrl };
+                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash };
                 }
 
                 string json = JsonConvert.SerializeObject(data);
@@ -168,12 +166,23 @@ namespace Zeepkist.Ai
             harmony?.UnpatchSelf();
             inputServer?.Close();
             telemetryClient?.Close();
+            pointsClient?.Close();
             if (visualizer != null) Destroy(visualizer.gameObject);
         }
 
-        public static void SetGhostUrl(string url)
+        public static void SendGhostToPython(List<Vector3> points)
         {
-            currentGhostUrl = url;
+            if (points == null || points.Count == 0) return;
+            try {
+                int chunkSize = 100;
+                for (int i = 0; i < points.Count; i += chunkSize) {
+                    var chunk = points.Skip(i).Take(chunkSize).Select(p => new float[] { p.x, p.y, p.z }).ToList();
+                    var data = new { Points = chunk, IsLast = (i + chunkSize >= points.Count) };
+                    string json = JsonConvert.SerializeObject(data);
+                    byte[] bytes = Encoding.UTF8.GetBytes(json);
+                    pointsClient.Send(bytes, bytes.Length, pointsEndPoint);
+                }
+            } catch { }
         }
 
         [HarmonyPatch(typeof(New_ControlCar), "Update")]
@@ -209,126 +218,48 @@ namespace Zeepkist.Ai
         private LineRenderer line;
         private string lastHash = "";
         private static readonly HttpClient client = new HttpClient();
-        private UdpClient pointsServer;
-        private IPEndPoint pointsEndPoint;
-        private List<Vector3> receivedPoints = new List<Vector3>();
-        private bool hasNewPoints = false;
-
-        public void Initialize(int port)
-        {
-            Debug.Log($"[AI_DEBUG] Initializing Points Receiver on port {port}");
-            try {
-                if (pointsServer != null) pointsServer.Close();
-                pointsServer = new UdpClient(port);
-                pointsEndPoint = new IPEndPoint(IPAddress.Any, port);
-                pointsServer.BeginReceive(new AsyncCallback(OnReceivePoints), null);
-                Debug.Log($"[AI_DEBUG] UDP Points Receiver successfully started on port {port}");
-            } catch (Exception ex) {
-                Debug.LogError($"[AI_DEBUG] CRITICAL: Failed to start points receiver: {ex.Message}");
-            }
-        }
-
-        private void OnReceivePoints(IAsyncResult res)
-        {
-            try {
-                byte[] bytes = pointsServer.EndReceive(res, ref pointsEndPoint);
-                string json = Encoding.UTF8.GetString(bytes);
-                Debug.Log($"[AI_DEBUG] Received UDP packet: {bytes.Length} bytes.");
-                
-                var wrapper = JsonConvert.DeserializeObject<PointsWrapper>(json);
-                if (wrapper != null && wrapper.Points != null) {
-                    lock(receivedPoints) {
-                        int startCount = receivedPoints.Count;
-                        foreach (var p in wrapper.Points) {
-                            receivedPoints.Add(new Vector3(p[0], p[1] + 2.0f, p[2]));
-                        }
-                        hasNewPoints = true;
-                        Debug.Log($"[AI_DEBUG] Parsed {wrapper.Points.Count} points. Total in queue: {receivedPoints.Count}");
-                        if (wrapper.Points.Count > 0) {
-                            var first = wrapper.Points[0];
-                            Debug.Log($"[AI_DEBUG] Sample point (raw): {first[0]}, {first[1]}, {first[2]}");
-                        }
-                    }
-                } else {
-                    Debug.LogWarning("[AI_DEBUG] Received packet but Points wrapper was null or empty.");
-                }
-            } catch (Exception ex) {
-                Debug.LogError($"[AI_DEBUG] Error in OnReceivePoints: {ex.Message}\n{ex.StackTrace}");
-            }
-
-            try {
-                pointsServer.BeginReceive(new AsyncCallback(OnReceivePoints), null);
-            } catch (Exception ex) {
-                Debug.LogError($"[AI_DEBUG] Error restarting BeginReceive: {ex.Message}");
-            }
-        }
+        private static readonly LZMACompressor compressor = new LZMACompressor();
 
         private void Awake()
         {
-            Debug.Log("[AI_DEBUG] GhostVisualizer component is waking up...");
             line = gameObject.AddComponent<LineRenderer>();
             line.useWorldSpace = true;
-            line.startWidth = 2.0f;
-            line.endWidth = 2.0f;
+            line.startWidth = 1.0f;
+            line.endWidth = 1.0f;
             line.positionCount = 0;
-            
-            Shader shader = Shader.Find("Hidden/Internal-CombinedDiffuse");
-            if (shader == null) shader = Shader.Find("Sprites/Default");
-            Debug.Log($"[AI_DEBUG] Using shader: {shader?.name ?? "NULL"}");
-            
-            line.material = new Material(shader);
+            line.material = new Material(Shader.Find("Sprites/Default"));
             line.startColor = Color.magenta;
             line.endColor = Color.magenta;
             line.sortingOrder = 10000;
-            
-            Debug.Log("[AI_DEBUG] GhostVisualizer LineRenderer configured.");
-        }
-
-        private void Update()
-        {
-            if (hasNewPoints) {
-                lock(receivedPoints) {
-                    Debug.Log($"[AI_DEBUG] Update loop: Applying {receivedPoints.Count} points to LineRenderer.");
-                    line.positionCount = receivedPoints.Count;
-                    line.SetPositions(receivedPoints.ToArray());
-                    hasNewPoints = false;
-                    Debug.Log("[AI_DEBUG] Update loop: LineRenderer positions updated.");
-                }
-            }
         }
 
         public async void RefreshGhost(string levelHash)
         {
-            Debug.Log($"[AI_DEBUG] RefreshGhost called for level: {levelHash}");
-            if (levelHash == lastHash || levelHash == "Unknown") {
-                Debug.Log($"[AI_DEBUG] Skipping refresh (Last: {lastHash}, New: {levelHash})");
-                return;
-            }
+            if (levelHash == lastHash || levelHash == "Unknown") return;
             lastHash = levelHash;
-            
-            lock(receivedPoints) {
-                line.positionCount = 0;
-                receivedPoints.Clear();
-                Debug.Log("[AI_DEBUG] Cleared old ghost points.");
-            }
-            
-            Plugin.SetGhostUrl("");
+            line.positionCount = 0;
 
             try
             {
-                Debug.Log("[AI_DEBUG] Fetching ghost URL via GraphQL...");
                 string ghostUrl = await FetchGhostUrl(levelHash);
-                if (!string.IsNullOrEmpty(ghostUrl)) {
-                    Debug.Log($"[AI_DEBUG] Found ghost URL: {ghostUrl}");
-                    Plugin.SetGhostUrl(ghostUrl);
-                } else {
-                    Debug.LogWarning("[AI_DEBUG] GraphQL returned no ghost URL for this level.");
+                if (string.IsNullOrEmpty(ghostUrl)) return;
+
+                byte[] compressedData = await client.GetByteArrayAsync(ghostUrl);
+                byte[] decompressedData = compressor.Decompress(compressedData);
+
+                using (var ms = new MemoryStream(decompressedData))
+                {
+                    var ghost = Serializer.Deserialize<GtrGhostFile>(ms);
+                    if (ghost != null && ghost.Frames != null)
+                    {
+                        var points = ghost.Frames.Select(f => new Vector3(f.Position.X, f.Position.Y, f.Position.Z)).ToList();
+                        line.positionCount = points.Count;
+                        line.SetPositions(points.ToArray());
+                        Plugin.SendGhostToPython(points);
+                    }
                 }
             }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[AI_DEBUG] RefreshGhost Exception: {ex.Message}");
-            }
+            catch { }
         }
 
         private async Task<string> FetchGhostUrl(string hash)
@@ -353,17 +284,40 @@ namespace Zeepkist.Ai
             }
 
             if (urls.Count == 0) return null;
-            int indexToPick = urls.Count >= 5 ? 4 : 0; // Prefer 5th rank for natural line
+            int indexToPick = urls.Count >= 5 ? 4 : 0; 
             return urls[indexToPick];
         }
+    }
 
-        private class PointsWrapper {
-            public List<float[]> Points { get; set; }
-        }
+    [ProtoContract]
+    public class GtrGhostFile
+    {
+        [ProtoMember(1)] public List<GtrGhostFrame> Frames { get; set; }
+    }
 
-        private void OnDestroy() {
-            pointsServer?.Close();
-        }
+    [ProtoContract]
+    public class GtrGhostFrame
+    {
+        [ProtoMember(1)] public float Time { get; set; }
+        [ProtoMember(2)] public GtrVector3 Position { get; set; }
+        [ProtoMember(3)] public GtrQuaternion Rotation { get; set; }
+    }
+
+    [ProtoContract]
+    public class GtrVector3
+    {
+        [ProtoMember(1)] public float X { get; set; }
+        [ProtoMember(2)] public float Y { get; set; }
+        [ProtoMember(3)] public float Z { get; set; }
+    }
+
+    [ProtoContract]
+    public class GtrQuaternion
+    {
+        [ProtoMember(1)] public float X { get; set; }
+        [ProtoMember(2)] public float Y { get; set; }
+        [ProtoMember(3)] public float Z { get; set; }
+        [ProtoMember(4)] public float W { get; set; }
     }
 
     [Serializable]
