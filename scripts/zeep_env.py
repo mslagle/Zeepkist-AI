@@ -187,6 +187,9 @@ class ZeepkistEnv(gym.Env):
         while not self._receive_telemetry():
             time.sleep(0.1)
 
+        # NEW: Force send points to mod on every reset to ensure visualizer is active
+        self._send_ghost_points()
+
         return self._get_obs(), {}
 
     def _get_nearest_ghost_info(self):
@@ -244,17 +247,29 @@ class ZeepkistEnv(gym.Env):
             
         return obs
 
-    def _calculate_reward(self, obs):
+    def _calculate_reward(self, obs, brake_val):
         reward = 0.0
         speed = obs[13]
+        
+        # 1. Progress Reward (Primary Driver)
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
             reward += progress_gain * 5.0
             self.max_ghost_index = self.last_ghost_index
+            
+        # 2. Speed bonus (Increased to encourage moving)
         if speed > 2.0:
-            reward += 0.1 * speed
+            reward += 0.2 * speed
+        
+        # 3. Proximity bonus
         dist_2d = np.linalg.norm(obs[[14, 16]])
         reward += max(0, 5.0 - (dist_2d / 10.0))
+
+        # 4. Brake Penalty
+        # Discourage holding the brake unless necessary
+        if brake_val > 0.5:
+            reward -= 0.5 * brake_val
+            
         return reward
 
     def _send_input(self, steering, brake, arms_up, reset=False):
@@ -265,7 +280,12 @@ class ZeepkistEnv(gym.Env):
 
     def step(self, action):
         self.steps_in_episode += 1
-        self._send_input(action[0], action[1] > 0.5, action[2] > 0.5, reset=False)
+        
+        steering = action[0]
+        brake_val = action[1]
+        arms_up = action[2] > 0.5
+
+        self._send_input(steering, brake_val > 0.5, arms_up, reset=False)
 
         if not self._receive_telemetry():
             return self._get_obs(), -0.1, False, False, {}
@@ -274,7 +294,7 @@ class ZeepkistEnv(gym.Env):
             return self._get_obs(), -50.0, True, False, {}
 
         obs = self._get_obs()
-        reward = self._calculate_reward(obs)
+        reward = self._calculate_reward(obs, brake_val)
         speed = obs[13]
         terminated = False
         truncated = False

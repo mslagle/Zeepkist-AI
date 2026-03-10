@@ -226,15 +226,14 @@ namespace Zeepkist.Ai
             try {
                 byte[] bytes = pointsServer.EndReceive(res, ref pointsEndPoint);
                 string json = Encoding.UTF8.GetString(bytes);
-                // Debug.Log($"AI: Received UDP packet ({bytes.Length} bytes)");
                 
                 var wrapper = JsonConvert.DeserializeObject<PointsWrapper>(json);
                 if (wrapper != null && wrapper.Points != null) {
                     lock(receivedPoints) {
-                        receivedPoints.AddRange(wrapper.Points.Select(p => new Vector3(p[0], p[1], p[2])));
+                        // Offset Y by 2.0 meters to ensure it's above the track
+                        receivedPoints.AddRange(wrapper.Points.Select(p => new Vector3(p[0], p[1] + 2.0f, p[2])));
                         hasNewPoints = true;
                     }
-                    // Debug.Log($"AI: Parsed {wrapper.Points.Count} points. Total queue: {receivedPoints.Count}");
                 }
             } catch (Exception ex) {
                 Debug.LogError($"AI: Error receiving/parsing points: {ex.Message}");
@@ -249,19 +248,19 @@ namespace Zeepkist.Ai
         {
             line = gameObject.AddComponent<LineRenderer>();
             line.useWorldSpace = true;
-            line.startWidth = 1.0f; // Thicker for visibility
-            line.endWidth = 1.0f;
+            line.startWidth = 2.0f; // Very thick
+            line.endWidth = 2.0f;
             line.positionCount = 0;
             
-            // Try different shaders if one fails
-            line.material = new Material(Shader.Find("Unlit/Color"));
+            // Use a very basic, bright material
+            line.material = new Material(Shader.Find("Hidden/Internal-CombinedDiffuse"));
             if (line.material == null) line.material = new Material(Shader.Find("Sprites/Default"));
             
-            line.startColor = Color.green; // Bright green for visibility
-            line.endColor = Color.green;
-            line.sortingOrder = 9999;
+            line.startColor = Color.magenta; // Highly visible
+            line.endColor = Color.magenta;
+            line.sortingOrder = 10000;
             
-            Debug.Log("AI: GhostVisualizer created and initialized.");
+            Debug.Log("AI: GhostVisualizer initialized with Magenta 2.0 width.");
         }
 
         private void Update()
