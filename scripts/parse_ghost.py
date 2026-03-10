@@ -16,101 +16,80 @@ class ZeepGhostParser:
         with open(self.file_path, 'rb') as f:
             raw_data = f.read()
 
-        # Zeepkist GTR Ghost files usually start with LZMA (5D 00 00 01 00)
-        # 13 byte header: 5 bytes properties, 8 bytes uncompressed size
+        # 1. Decompress LZMA
         if raw_data.startswith(b'\x5d\x00\x00'):
-            print(f"Decompressing LZMA ghost: {self.file_path}")
             try:
-                # Standard lzma module supports the 13-byte header format (FORMAT_ALONE)
-                decompressed = lzma.decompress(raw_data, format=lzma.FORMAT_ALONE)
-                reader = io.BytesIO(decompressed)
+                data = lzma.decompress(raw_data, format=lzma.FORMAT_ALONE)
             except Exception as e:
-                print(f"LZMA Decompression (FORMAT_ALONE) failed: {e}. Trying raw.")
-                try:
-                    # Fallback: try raw if the header is somehow non-standard
-                    decompressed = lzma.decompress(raw_data[13:], format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA1, "dict_size": 1 << 24}])
-                    reader = io.BytesIO(decompressed)
-                except Exception as e2:
-                    print(f"LZMA Decompression (RAW) failed: {e2}")
-                    raise e
+                print(f"LZMA Decompression failed: {e}")
+                # Fallback to raw if possible
+                data = raw_data
         else:
-            reader = io.BytesIO(raw_data)
+            data = raw_data
 
-        data = reader.read()
-        total_len = len(data)
+        # 2. Parse Protobuf-like stream
+        # Each frame is a message containing Position (Tag 2) and Rotation (Tag 3)
+        # Position is 3x fixed32 (15 bytes delimited)
+        # Rotation is 4x fixed32 (20 bytes delimited)
         
-        # We search for a reasonable frame count and frame size
-        # We start looking from the end of common small headers (0 to 150 bytes)
-        for offset in range(0, min(150, total_len)):
-            remaining = total_len - offset
-            if remaining >= 4:
-                potential_count = struct.unpack('<i', data[offset:offset+4])[0]
-                
-                # Check for 32-byte frames (float time, Vector3 pos, Quaternion rot)
-                if potential_count > 0 and (remaining - 4) >= (potential_count * 32):
-                    # verify it's not a huge number
-                    if potential_count < 100000:
-                        print(f"Detected {potential_count} frames at offset {offset+4} with size 32")
-                        self.frames = self._extract_frames(data[offset+4:], potential_count, 32)
-                        if len(self.frames) > 0:
-                            return self.header, self.frames
-
-                # Check for 28-byte frames (Vector3 pos, Quaternion rot)
-                if potential_count > 0 and (remaining - 4) >= (potential_count * 28):
-                    if potential_count < 100000:
-                        print(f"Detected {potential_count} frames at offset {offset+4} with size 28")
-                        self.frames = self._extract_frames(data[offset+4:], potential_count, 28)
-                        if len(self.frames) > 0:
-                            return self.header, self.frames
-
-        # Fallback division search
-        for frame_size in [32, 28]:
-            if total_len % frame_size == 0:
-                print(f"Fallback: Exact division match for frame size {frame_size}")
-                self.frames = self._extract_frames(data, total_len // frame_size, frame_size)
-                return self.header, self.frames
-
-        # Final effort: brute force searching for float blocks
-        for offset in range(min(total_len - 32, 500)):
-            try:
-                # Look for a pattern of 8 floats where the first is a timestamp
-                test = struct.unpack('<ffffffff', data[offset:offset+32])
-                if 0 <= test[0] < 3600 and all(-10000 < x < 10000 for x in test[1:4]):
-                    count = (total_len - offset) // 32
-                    print(f"Brute force match at offset {offset} with 32-byte frames")
-                    self.frames = self._extract_frames(data[offset:], count, 32)
-                    return self.header, self.frames
-            except:
-                continue
-
-        raise RuntimeError(f"Could not find valid ghost frame structure in file. Decompressed size: {total_len} bytes")
-
-    def _extract_frames(self, data, count, size):
-        frames = []
-        for i in range(count):
-            start = i * size
-            buf = data[start : start + size]
-            if len(buf) < size: break
+        self.frames = []
+        i = 0
+        total = len(data)
+        
+        while i < total - 40:
+            # We look for the start of a frame. 
+            # In our observed data, Position is often Tag 2 (0x12) or Tag 1 (0x0A)
+            # and follows a specific length.
             
+            # Let's search for the Vector3 pattern: 0D [4] 15 [4] 1D [4]
+            # This is Tag 1, 2, 3 of a nested message
+            
+            found_pos = False
+            if i + 15 < total and data[i] == 0x0D and data[i+5] == 0x15 and data[i+10] == 0x1D:
+                # Potential Vector3 (raw or inside message)
+                try:
+                    px, py, pz = struct.unpack('<fff', data[i+1:i+5] + data[i+6:i+10] + data[i+11:i+15])
+                    
+                    # Now look for Rotation nearby (Tag 3 usually follows)
+                    # We scan a small window for the Quaternion pattern: 0D [4] 15 [4] 1D [4] 25 [4]
+                    for j in range(i + 15, min(i + 60, total - 20)):
+                        if data[j] == 0x0D and data[j+5] == 0x15 and data[j+10] == 0x1D and data[j+15] == 0x25:
+                            rx, ry, rz, rw = struct.unpack('<ffff', data[j+1:j+5] + data[j+6:j+10] + data[j+11:j+15] + data[j+16:j+20])
+                            self.frames.append({
+                                'pos': (float(px), float(py), float(pz)),
+                                'rot': (float(rx), float(ry), float(rz), float(rw))
+                            })
+                            i = j + 20 # Advance to end of rotation
+                            found_pos = True
+                            break
+                except:
+                    pass
+            
+            if not found_pos:
+                i += 1
+
+        if not self.frames:
+            print("WARNING: Protobuf parser found no frames. Falling back to raw float scan.")
+            return self._fallback_parse(data)
+
+        print(f"Successfully parsed {len(self.frames)} frames via Protobuf scanner.")
+        return self.header, self.frames
+
+    def _fallback_parse(self, data):
+        # Last resort: just find any sequence of 7 or 8 floats that look like a car
+        self.frames = []
+        i = 0
+        while i < len(data) - 32:
             try:
-                if size == 32:
-                    # time, pos(x,y,z), rot(x,y,z,w)
-                    f = struct.unpack('<ffffffff', buf)
-                    frames.append({
-                        'time': f[0],
-                        'pos': (float(f[1]), float(f[2]), float(f[3])),
-                        'rot': (float(f[4]), float(f[5]), float(f[6]), float(f[7]))
-                    })
-                elif size == 28:
-                    # pos(x,y,z), rot(x,y,z,w)
-                    f = struct.unpack('<fffffff', buf)
-                    frames.append({
-                        'pos': (float(f[0]), float(f[1]), float(f[2])),
-                        'rot': (float(f[3]), float(f[4]), float(f[5]), float(f[6]))
-                    })
-            except:
-                break
-        return frames
+                # Try 32-byte frame
+                f = struct.unpack('<ffffffff', data[i:i+32])
+                if -2000 < f[1] < 5000 and -2000 < f[2] < 5000 and -2000 < f[3] < 5000:
+                    self.frames.append({'pos': f[1:4], 'rot': f[4:8]})
+                    i += 32
+                    continue
+            except: pass
+            i += 1
+        return self.header, self.frames
 
 if __name__ == "__main__":
     pass

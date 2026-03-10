@@ -27,6 +27,7 @@ namespace Zeepkist.Ai
         public static ConfigEntry<bool> ShowGhostPath { get; private set; }
         public static ConfigEntry<int> TelemetryPort { get; private set; }
         public static ConfigEntry<int> InputPort { get; private set; }
+        public static ConfigEntry<int> PointsPort { get; private set; }
 
         private static UdpClient telemetryClient;
         private static IPEndPoint telemetryEndPoint;
@@ -48,18 +49,19 @@ namespace Zeepkist.Ai
             ShowGhostPath = Config.Bind<bool>("Visuals", "Show GTR Ghost Path", true);
             TelemetryPort = Config.Bind<int>("Network", "Telemetry Port", 9090);
             InputPort = Config.Bind<int>("Network", "Input Port", 9091);
+            PointsPort = Config.Bind<int>("Network", "Ghost Points Port", 9092);
 
             SetupNetwork();
 
             RacingApi.PlayerSpawned += () => {
                 playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
                 currentLevelHash = LevelApi.CurrentLevel?.UID ?? "Unknown";
-                Debug.Log($"AI: Player spawned on level {currentLevelHash}");
-
+                
                 if (visualizer == null)
                 {
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
                     visualizer = vizObj.AddComponent<GhostVisualizer>();
+                    visualizer.Initialize(PointsPort.Value);
                 }
                 visualizer.RefreshGhost(currentLevelHash);
             };
@@ -201,41 +203,97 @@ namespace Zeepkist.Ai
         private LineRenderer line;
         private string lastHash = "";
         private static readonly HttpClient client = new HttpClient();
+        private UdpClient pointsServer;
+        private IPEndPoint pointsEndPoint;
+        private List<Vector3> receivedPoints = new List<Vector3>();
+        private bool hasNewPoints = false;
+
+        public void Initialize(int port)
+        {
+            try {
+                if (pointsServer != null) pointsServer.Close();
+                pointsServer = new UdpClient(port);
+                pointsEndPoint = new IPEndPoint(IPAddress.Any, port);
+                pointsServer.BeginReceive(new AsyncCallback(OnReceivePoints), null);
+                Debug.Log($"AI: Ghost Points receiver started on port {port}");
+            } catch (Exception ex) {
+                Debug.LogError($"AI: Failed to start points receiver: {ex.Message}");
+            }
+        }
+
+        private void OnReceivePoints(IAsyncResult res)
+        {
+            try {
+                byte[] bytes = pointsServer.EndReceive(res, ref pointsEndPoint);
+                string json = Encoding.UTF8.GetString(bytes);
+                // Debug.Log($"AI: Received UDP packet ({bytes.Length} bytes)");
+                
+                var wrapper = JsonConvert.DeserializeObject<PointsWrapper>(json);
+                if (wrapper != null && wrapper.Points != null) {
+                    lock(receivedPoints) {
+                        receivedPoints.AddRange(wrapper.Points.Select(p => new Vector3(p[0], p[1], p[2])));
+                        hasNewPoints = true;
+                    }
+                    // Debug.Log($"AI: Parsed {wrapper.Points.Count} points. Total queue: {receivedPoints.Count}");
+                }
+            } catch (Exception ex) {
+                Debug.LogError($"AI: Error receiving/parsing points: {ex.Message}");
+            }
+
+            try {
+                pointsServer.BeginReceive(new AsyncCallback(OnReceivePoints), null);
+            } catch { }
+        }
 
         private void Awake()
         {
             line = gameObject.AddComponent<LineRenderer>();
-            line.startWidth = 0.5f;
-            line.endWidth = 0.5f;
+            line.useWorldSpace = true;
+            line.startWidth = 1.0f; // Thicker for visibility
+            line.endWidth = 1.0f;
             line.positionCount = 0;
-            line.material = new Material(Shader.Find("Sprites/Default"));
-            line.startColor = Color.cyan;
-            line.endColor = Color.blue;
+            
+            // Try different shaders if one fails
+            line.material = new Material(Shader.Find("Unlit/Color"));
+            if (line.material == null) line.material = new Material(Shader.Find("Sprites/Default"));
+            
+            line.startColor = Color.green; // Bright green for visibility
+            line.endColor = Color.green;
+            line.sortingOrder = 9999;
+            
+            Debug.Log("AI: GhostVisualizer created and initialized.");
+        }
+
+        private void Update()
+        {
+            if (hasNewPoints) {
+                lock(receivedPoints) {
+                    Debug.Log($"AI: Updating LineRenderer with {receivedPoints.Count} points.");
+                    line.positionCount = receivedPoints.Count;
+                    line.SetPositions(receivedPoints.ToArray());
+                    hasNewPoints = false;
+                }
+            }
         }
 
         public async void RefreshGhost(string levelHash)
         {
             if (levelHash == lastHash || levelHash == "Unknown") return;
+            Debug.Log($"AI: Refreshing ghost for level {levelHash}");
             lastHash = levelHash;
-            line.positionCount = 0;
+            
+            lock(receivedPoints) {
+                line.positionCount = 0;
+                receivedPoints.Clear();
+            }
+            
             Plugin.SetGhostUrl("");
 
             try
             {
                 string ghostUrl = await FetchGhostUrl(levelHash);
-                if (string.IsNullOrEmpty(ghostUrl)) return;
-
-                Plugin.SetGhostUrl(ghostUrl);
-
-                if (Plugin.ShowGhostPath.Value)
-                {
-                    byte[] data = await client.GetByteArrayAsync(ghostUrl);
-                    List<Vector3> points = ParseGhostPoints(data);
-                    if (points.Count > 0)
-                    {
-                        line.positionCount = points.Count;
-                        line.SetPositions(points.ToArray());
-                    }
+                if (!string.IsNullOrEmpty(ghostUrl)) {
+                    Plugin.SetGhostUrl(ghostUrl);
                 }
             }
             catch (Exception ex)
@@ -246,13 +304,11 @@ namespace Zeepkist.Ai
 
         private async Task<string> FetchGhostUrl(string hash)
         {
-            // Fetch top 10 records instead of just 1
             string query = "{\"query\": \"query GetGhost($hash: String!) { levels(filter: { hash: { equalTo: $hash } }) { nodes { records(orderBy: TIME_ASC, first: 10) { nodes { recordMedia { ghostUrl } } } } } }\", \"variables\": { \"hash\": \"" + hash + "\" }}";
             var content = new StringContent(query, Encoding.UTF8, "application/json");
             var response = await client.PostAsync("https://graphql.zeepki.st", content);
             var json = await response.Content.ReadAsStringAsync();
             
-            // Collect all ghostUrls found
             List<string> urls = new List<string>();
             int currentPos = 0;
             while (true)
@@ -268,41 +324,16 @@ namespace Zeepkist.Ai
             }
 
             if (urls.Count == 0) return null;
-
-            // Pick a "middle-ranked" ghost if possible (e.g. 5th to 10th)
-            // Fastest ghosts often use exploits or "weird tricks" that are bad for general AI training.
-            int indexToPick = 0; // Default to fastest if only 1
-            if (urls.Count >= 10) indexToPick = UnityEngine.Random.Range(4, 10); // 5th to 10th
-            else if (urls.Count >= 5) indexToPick = UnityEngine.Random.Range(2, urls.Count); // 3rd to last
-            else if (urls.Count > 1) indexToPick = urls.Count - 1; // Last one available
-
-            Debug.Log($"AI: Picking ghost rank {indexToPick + 1} of {urls.Count} for more 'natural' racing line.");
+            int indexToPick = urls.Count >= 5 ? 4 : 0; // Prefer 5th rank for natural line
             return urls[indexToPick];
         }
 
-        private List<Vector3> ParseGhostPoints(byte[] data)
-        {
-            List<Vector3> points = new List<Vector3>();
-            if (data[0] == 0x5D) 
-            {
-                // LZMA visualization skipped for now
-                return points;
-            }
+        private class PointsWrapper {
+            public List<float[]> Points { get; set; }
+        }
 
-            using (MemoryStream ms = new MemoryStream(data))
-            using (BinaryReader reader = new BinaryReader(ms))
-            {
-                try {
-                    while (ms.Position + 28 <= ms.Length) {
-                        float x = reader.ReadSingle();
-                        float y = reader.ReadSingle();
-                        float z = reader.ReadSingle();
-                        points.Add(new Vector3(x, y, z));
-                        ms.Seek(16, SeekOrigin.Current); 
-                    }
-                } catch { }
-            }
-            return points;
+        private void OnDestroy() {
+            pointsServer?.Close();
         }
     }
 
@@ -313,13 +344,5 @@ namespace Zeepkist.Ai
         public bool Brake;
         public bool ArmsUp;
         public bool Reset;
-    }
-}
-
-public static class StringExtensions
-{
-    public static int indexOf(this string str, string value, int startIndex = 0)
-    {
-        return str.IndexOf(value, startIndex);
     }
 }
