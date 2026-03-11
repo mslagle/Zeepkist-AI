@@ -11,11 +11,7 @@ using UnityEngine;
 using ZeepSDK.Racing;
 using ZeepSDK.Level;
 using Newtonsoft.Json;
-using System.Net.Http;
-using System.Threading.Tasks;
-using System.IO;
-using ProtoBuf;
-using EasyCompressor;
+using System.Reflection;
 
 namespace Zeepkist.Ai
 {
@@ -45,6 +41,7 @@ namespace Zeepkist.Ai
 
         private void Awake()
         {
+            Debug.Log("[AI_DEBUG] === Plugin.Awake() STARTING ===");
             harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
             harmony.PatchAll();
 
@@ -65,14 +62,13 @@ namespace Zeepkist.Ai
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
                     visualizer = vizObj.AddComponent<GhostVisualizer>();
                 }
-                visualizer.RefreshGhost(currentLevelHash);
             };
 
             RacingApi.Crashed += (reason) => { playerCar = null; };
             RacingApi.CrossedFinishLine += (time) => { playerCar = null; };
             RacingApi.WheelBroken += () => { playerCar = null; };
 
-            Debug.Log($"Plugin {MyPluginInfo.PLUGIN_GUID} loaded!");
+            Debug.Log($"[AI_DEBUG] Plugin fully initialized!");
         }
 
         private void SetupNetwork()
@@ -170,19 +166,49 @@ namespace Zeepkist.Ai
             if (visualizer != null) Destroy(visualizer.gameObject);
         }
 
-        public static void SendGhostToPython(List<Vector3> points)
+        public static void SendPointsToPython(List<Vector3> points, string levelHash)
         {
             if (points == null || points.Count == 0) return;
             try {
+                var metadata = new { Type = "Metadata", LevelHash = levelHash, FrameCount = points.Count };
+                byte[] metaBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(metadata));
+                pointsClient.Send(metaBytes, metaBytes.Length, pointsEndPoint);
+
                 int chunkSize = 100;
                 for (int i = 0; i < points.Count; i += chunkSize) {
-                    var chunk = points.Skip(i).Take(chunkSize).Select(p => new float[] { p.x, p.y, p.z }).ToList();
-                    var data = new { Points = chunk, IsLast = (i + chunkSize >= points.Count) };
-                    string json = JsonConvert.SerializeObject(data);
-                    byte[] bytes = Encoding.UTF8.GetBytes(json);
+                    var chunk = points.Skip(i).Take(chunkSize).Select(p => new { p = new float[] { p.x, p.y, p.z } }).ToList();
+                    var data = new { Type = "Points", Points = chunk, IsLast = (i + chunkSize >= points.Count) };
+                    byte[] bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(data));
                     pointsClient.Send(bytes, bytes.Length, pointsEndPoint);
+                    System.Threading.Thread.Sleep(5); 
                 }
+                Debug.Log($"[AI_DEBUG] Sent {points.Count} points to Python.");
             } catch { }
+        }
+
+        // We hook into the game's ghost loading mechanism
+        [HarmonyPatch(typeof(GhostReplay), "SetupGhost")]
+        public static class GhostReplay_SetupGhost_Patch
+        {
+            public static void Postfix(GhostReplay __instance, GhostData ghostData)
+            {
+                if (ghostData == null || ghostData.frames == null) return;
+                
+                Debug.Log($"[AI_DEBUG] Intercepted GhostData: {ghostData.frames.Count} frames.");
+                
+                List<Vector3> points = new List<Vector3>();
+                foreach (var frame in ghostData.frames)
+                {
+                    points.Add(frame.position);
+                }
+
+                if (visualizer != null)
+                {
+                    visualizer.UpdateLine(points);
+                }
+                
+                SendPointsToPython(points, LevelApi.CurrentLevel?.UID ?? "Unknown");
+            }
         }
 
         [HarmonyPatch(typeof(New_ControlCar), "Update")]
@@ -216,9 +242,6 @@ namespace Zeepkist.Ai
     public class GhostVisualizer : MonoBehaviour
     {
         private LineRenderer line;
-        private string lastHash = "";
-        private static readonly HttpClient client = new HttpClient();
-        private static readonly LZMACompressor compressor = new LZMACompressor();
 
         private void Awake()
         {
@@ -233,91 +256,12 @@ namespace Zeepkist.Ai
             line.sortingOrder = 10000;
         }
 
-        public async void RefreshGhost(string levelHash)
+        public void UpdateLine(List<Vector3> points)
         {
-            if (levelHash == lastHash || levelHash == "Unknown") return;
-            lastHash = levelHash;
-            line.positionCount = 0;
-
-            try
-            {
-                string ghostUrl = await FetchGhostUrl(levelHash);
-                if (string.IsNullOrEmpty(ghostUrl)) return;
-
-                byte[] compressedData = await client.GetByteArrayAsync(ghostUrl);
-                byte[] decompressedData = compressor.Decompress(compressedData);
-
-                using (var ms = new MemoryStream(decompressedData))
-                {
-                    var ghost = Serializer.Deserialize<GtrGhostFile>(ms);
-                    if (ghost != null && ghost.Frames != null)
-                    {
-                        var points = ghost.Frames.Select(f => new Vector3(f.Position.X, f.Position.Y, f.Position.Z)).ToList();
-                        line.positionCount = points.Count;
-                        line.SetPositions(points.ToArray());
-                        Plugin.SendGhostToPython(points);
-                    }
-                }
-            }
-            catch { }
+            if (points == null) return;
+            line.positionCount = points.Count;
+            line.SetPositions(points.ToArray());
         }
-
-        private async Task<string> FetchGhostUrl(string hash)
-        {
-            string query = "{\"query\": \"query GetGhost($hash: String!) { levels(filter: { hash: { equalTo: $hash } }) { nodes { records(orderBy: TIME_ASC, first: 10) { nodes { recordMedia { ghostUrl } } } } } }\", \"variables\": { \"hash\": \"" + hash + "\" }}";
-            var content = new StringContent(query, Encoding.UTF8, "application/json");
-            var response = await client.PostAsync("https://graphql.zeepki.st", content);
-            var json = await response.Content.ReadAsStringAsync();
-            
-            List<string> urls = new List<string>();
-            int currentPos = 0;
-            while (true)
-            {
-                int urlIndex = json.IndexOf("\"ghostUrl\":\"", currentPos);
-                if (urlIndex == -1) break;
-                int start = urlIndex + 12;
-                int end = json.IndexOf("\"", start);
-                string url = json.Substring(start, end - start);
-                if (url.StartsWith("//")) url = "https:" + url;
-                urls.Add(url);
-                currentPos = end;
-            }
-
-            if (urls.Count == 0) return null;
-            int indexToPick = urls.Count >= 5 ? 4 : 0; 
-            return urls[indexToPick];
-        }
-    }
-
-    [ProtoContract]
-    public class GtrGhostFile
-    {
-        [ProtoMember(1)] public List<GtrGhostFrame> Frames { get; set; }
-    }
-
-    [ProtoContract]
-    public class GtrGhostFrame
-    {
-        [ProtoMember(1)] public float Time { get; set; }
-        [ProtoMember(2)] public GtrVector3 Position { get; set; }
-        [ProtoMember(3)] public GtrQuaternion Rotation { get; set; }
-    }
-
-    [ProtoContract]
-    public class GtrVector3
-    {
-        [ProtoMember(1)] public float X { get; set; }
-        [ProtoMember(2)] public float Y { get; set; }
-        [ProtoMember(3)] public float Z { get; set; }
-    }
-
-    [ProtoContract]
-    public class GtrQuaternion
-    {
-        [ProtoMember(1)] public float X { get; set; }
-        [ProtoMember(2)] public float Y { get; set; }
-        [ProtoMember(3)] public float Z { get; set; }
-        [ProtoMember(4)] public float W { get; set; }
     }
 
     [Serializable]

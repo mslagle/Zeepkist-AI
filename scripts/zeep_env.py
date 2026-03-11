@@ -7,24 +7,24 @@ import threading
 import time
 import os
 import sys
-from parse_ghost import ZeepGhostParser
-from fetch_level import download_file
 
 class ZeepkistEnv(gym.Env):
-    def __init__(self, telemetry_port=9090, input_port=9091, host='127.0.0.1'):
+    def __init__(self, telemetry_port=9090, input_port=9091, points_port=9092, host='127.0.0.1'):
         super(ZeepkistEnv, self).__init__()
 
         self.telemetry_port = telemetry_port
         self.input_port = input_port
-        self.points_port = 9092
+        self.points_port = points_port
         self.host = host
 
+        # Action Space: [Steering, Brake, ArmsUp]
         self.action_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
             high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
 
+        # Observation Space: 22 dimensions
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -37,12 +37,14 @@ class ZeepkistEnv(gym.Env):
         self.telemetry_socket.settimeout(0.5) 
 
         self.input_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.points_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
+        self.points_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.points_socket.bind((self.host, self.points_port))
+        self.points_socket.settimeout(0.1)
+
         self.last_telemetry = None
         self.current_level_hash = None
-        self.current_ghost_url = None
-        self.ghost_frames = None
+        self.ghost_frames = []
         self.ghost_positions = None
         
         self.max_ghost_index = 0
@@ -54,91 +56,73 @@ class ZeepkistEnv(gym.Env):
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
 
-    def _send_ghost_points(self):
-        if self.ghost_positions is None: return
+    def _receive_points_from_mod(self):
+        """Listens for ghost data chunks from the C# mod."""
+        print("Listening for ghost data from mod...")
+        self.ghost_frames = []
+        expected_count = 0
+        received_count = 0
+        level_hash = "unknown"
         
-        print(f"Sending {len(self.ghost_positions)} points to mod for visualization...")
-        # Send a sampled version to mod to keep line renderer performance ok
-        # Every 5th point is plenty for a visual line
-        sampled = self.ghost_positions[::5]
-        
-        # Mod expects a JSON with "Points": [[x,y,z], [x,y,z], ...]
-        # We send in one big packet if possible, or chunks if too big.
-        # UDP limit is ~65kb, 1000 points is ~30kb.
-        chunk_size = 500
-        for i in range(0, len(sampled), chunk_size):
-            chunk = sampled[i : i + chunk_size]
-            data = {"Points": chunk.tolist()}
-            msg = json.dumps(data).encode('utf-8')
+        timeout_start = time.time()
+        while time.time() - timeout_start < 5.0: # 5 second total window to receive ghost
             try:
-                self.points_socket.sendto(msg, (self.host, self.points_port))
-                time.sleep(0.05) # Delay to allow mod processing
-            except: pass
-
-    def _update_ghost_data(self, level_hash, ghost_url):
-        if level_hash == self.current_level_hash and ghost_url == self.current_ghost_url and self.ghost_positions is not None:
-            return
-        
-        if not ghost_url:
-            return
-
-        print(f"New ghost discovered: {ghost_url} (Level: {level_hash})")
-        self.current_level_hash = level_hash
-        self.current_ghost_url = ghost_url
-        self.ghost_frames = None
-        self.ghost_positions = None
-        
-        ghost_path = f"ghosts/{level_hash}.zeepghost"
-        
-        if download_file(ghost_url, ghost_path):
-            try:
-                parser = ZeepGhostParser(ghost_path)
-                header, self.ghost_frames = parser.parse()
-                if self.ghost_frames:
-                    self.ghost_positions = np.array([f['pos'] for f in self.ghost_frames])
-                    print(f"Loaded {len(self.ghost_frames)} frames for level {level_hash}")
+                data, addr = self.points_socket.recvfrom(65535)
+                msg = json.loads(data.decode('utf-8'))
+                
+                if msg.get("Type") == "Metadata":
+                    expected_count = msg.get("FrameCount", 0)
+                    level_hash = msg.get("LevelHash", "unknown")
+                    print(f"Receiving {expected_count} frames for level {level_hash}")
+                    self.ghost_frames = [None] * expected_count
+                
+                elif msg.get("Type") == "Points":
+                    points_chunk = msg.get("Points", [])
+                    # Find start index if sent, but our mod just sends sequential chunks
+                    # So we track received_count
+                    for p in points_chunk:
+                        if received_count < len(self.ghost_frames):
+                            self.ghost_frames[received_count] = p
+                            received_count += 1
                     
-                    json_path = ghost_path.replace(".zeepghost", ".json")
-                    with open(json_path, 'w') as jf:
-                        json.dump({'header': header, 'frames': self.ghost_frames}, jf, indent=2)
-                    
-                    # Notify mod of new points
-                    self._send_ghost_points()
-                else:
-                    raise RuntimeError("Ghost parsed but empty")
+                    if msg.get("IsLast") or received_count >= expected_count:
+                        break
+            except socket.timeout:
+                if received_count > 0: continue # Keep waiting if we started receiving
+                break
             except Exception as e:
-                print(f"CRITICAL ERROR parsing ghost: {e}")
-                raise e
-        else:
-            raise RuntimeError(f"Failed to download ghost from {ghost_url}")
+                print(f"Error receiving points: {e}")
+                break
 
-    def _clear_telemetry_buffer(self):
-        original_timeout = self.telemetry_socket.gettimeout()
-        self.telemetry_socket.settimeout(0.0)
-        try:
-            while True:
-                self.telemetry_socket.recvfrom(8192)
-        except:
-            pass
-        self.telemetry_socket.settimeout(original_timeout)
+        # Clean up and save
+        valid_frames = [f for f in self.ghost_frames if f is not None]
+        if len(valid_frames) > 0:
+            self.current_level_hash = level_hash
+            self.ghost_positions = np.array([f['p'] for f in valid_frames])
+            print(f"Successfully received {len(valid_frames)} frames from mod.")
+            
+            # Save JSON as requested
+            json_path = f"ghosts/{level_hash}.json"
+            with open(json_path, 'w') as jf:
+                json.dump({'frames': valid_frames}, jf)
+            print(f"Saved ghost JSON to {json_path}")
+        else:
+            print("Failed to receive valid ghost frames from mod.")
 
     def _receive_telemetry(self):
         try:
             data, addr = self.telemetry_socket.recvfrom(8192)
             self.last_telemetry = json.loads(data.decode('utf-8'))
             
-            level_hash = self.last_telemetry.get('LevelHash')
-            ghost_url = self.last_telemetry.get('GhostUrl')
-            
-            if level_hash and ghost_url:
-                self._update_ghost_data(level_hash, ghost_url)
+            new_hash = self.last_telemetry.get('LevelHash')
+            if new_hash and new_hash != self.current_level_hash:
+                print(f"New level detected: {new_hash}")
+                self._receive_points_from_mod()
                 
             return True
         except socket.timeout:
             return False
-        except Exception as e:
-            if isinstance(e, RuntimeError):
-                raise e
+        except Exception:
             return False
 
     def reset(self, seed=None, options=None):
@@ -159,40 +143,45 @@ class ZeepkistEnv(gym.Env):
                     break
             time.sleep(0.05)
 
-        self._clear_telemetry_buffer()
+        # Clear buffers
+        for sock in [self.telemetry_socket, self.points_socket]:
+            original_timeout = sock.gettimeout()
+            sock.settimeout(0.0)
+            try:
+                while True: sock.recvfrom(65535)
+            except: pass
+            sock.settimeout(original_timeout)
 
-        print("Waiting for player to spawn and ghost data to load...")
+        print("Waiting for player to spawn...")
         spawned = False
         start_wait = time.time()
         
         while not spawned:
             self._send_input(0.0, False, False, reset=False)
             if self._receive_telemetry():
-                if self.last_telemetry.get('IsSpawned', False) and 'Position' in self.last_telemetry and self.ghost_positions is not None:
-                    spawned = True
-                    print("Ready! Player spawned and ghost loaded.")
+                if self.last_telemetry.get('IsSpawned', False) and 'Position' in self.last_telemetry:
+                    # We need ghost data before we can truly be "Ready"
+                    if self.ghost_positions is not None:
+                        spawned = True
+                        print("Ready! Player spawned and ghost data active.")
+                    else:
+                        print("Waiting for ghost data from mod...")
+                        self._receive_points_from_mod()
             
             if not spawned:
                 time.sleep(0.1)
             
-            if time.time() - start_wait > 15.0:
-                print("Spawn/Ghost timeout, retrying...")
+            if time.time() - start_wait > 20.0:
+                print("Reset timeout, retrying...")
                 self._send_input(0.0, False, False, reset=True)
-                time.sleep(0.5)
-                self._clear_telemetry_buffer()
                 start_wait = time.time()
-
-        time.sleep(0.5) 
-        self._clear_telemetry_buffer()
-        while not self._receive_telemetry():
-            time.sleep(0.1)
-
-        # NEW: Force send points to mod on every reset to ensure visualizer is active
-        self._send_ghost_points()
 
         return self._get_obs(), {}
 
     def _get_nearest_ghost_info(self):
+        if self.ghost_positions is None:
+            return np.zeros(3), 0, 0.0
+
         pos = np.array([
             self.last_telemetry['Position']['x'],
             self.last_telemetry['Position']['y'],
@@ -218,7 +207,7 @@ class ZeepkistEnv(gym.Env):
             
         self.last_ghost_index = idx
         relative_vec = self.ghost_positions[idx] - pos
-        progress = idx / len(self.ghost_positions)
+        progress = idx / len(self.ghost_positions) if len(self.ghost_positions) > 0 else 0.0
         
         return relative_vec, idx, progress
 
@@ -228,7 +217,7 @@ class ZeepkistEnv(gym.Env):
             return np.zeros(22, dtype=np.float32)
 
         rel_ghost_vec, _, progress = self._get_nearest_ghost_info()
-        ghost_loaded = 1.0
+        ghost_loaded = 1.0 if self.ghost_positions is not None else 0.0
         
         obs = np.array([
             t['Position']['x'], t['Position']['y'], t['Position']['z'],
@@ -250,26 +239,16 @@ class ZeepkistEnv(gym.Env):
     def _calculate_reward(self, obs, brake_val):
         reward = 0.0
         speed = obs[13]
-        
-        # 1. Progress Reward (Primary Driver)
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
             reward += progress_gain * 5.0
             self.max_ghost_index = self.last_ghost_index
-            
-        # 2. Speed bonus (Increased to encourage moving)
         if speed > 2.0:
             reward += 0.2 * speed
-        
-        # 3. Proximity bonus
         dist_2d = np.linalg.norm(obs[[14, 16]])
         reward += max(0, 5.0 - (dist_2d / 10.0))
-
-        # 4. Brake Penalty
-        # Discourage holding the brake unless necessary
         if brake_val > 0.5:
             reward -= 0.5 * brake_val
-            
         return reward
 
     def _send_input(self, steering, brake, arms_up, reset=False):
@@ -280,12 +259,8 @@ class ZeepkistEnv(gym.Env):
 
     def step(self, action):
         self.steps_in_episode += 1
-        
-        steering = action[0]
-        brake_val = action[1]
-        arms_up = action[2] > 0.5
-
-        self._send_input(steering, brake_val > 0.5, arms_up, reset=False)
+        steering, brake_val, arms_up_val = action[0], action[1], action[2]
+        self._send_input(steering, brake_val > 0.5, arms_up_val > 0.5, reset=False)
 
         if not self._receive_telemetry():
             return self._get_obs(), -0.1, False, False, {}
