@@ -186,31 +186,6 @@ namespace Zeepkist.Ai
             } catch { }
         }
 
-        // We hook into the game's ghost loading mechanism
-        [HarmonyPatch(typeof(GhostReplay), "SetupGhost")]
-        public static class GhostReplay_SetupGhost_Patch
-        {
-            public static void Postfix(GhostReplay __instance, GhostData ghostData)
-            {
-                if (ghostData == null || ghostData.frames == null) return;
-                
-                Debug.Log($"[AI_DEBUG] Intercepted GhostData: {ghostData.frames.Count} frames.");
-                
-                List<Vector3> points = new List<Vector3>();
-                foreach (var frame in ghostData.frames)
-                {
-                    points.Add(frame.position);
-                }
-
-                if (visualizer != null)
-                {
-                    visualizer.UpdateLine(points);
-                }
-                
-                SendPointsToPython(points, LevelApi.CurrentLevel?.UID ?? "Unknown");
-            }
-        }
-
         [HarmonyPatch(typeof(New_ControlCar), "Update")]
         public static class New_ControlCar_Update_Patch
         {
