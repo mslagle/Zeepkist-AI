@@ -4,4 +4,4 @@ using Zeepkist.Ai.GtrClient;
 Console.WriteLine("Hello, World!");
 
 GtrClient client = new GtrClient();
-await client.GetLevelByHash("ea1");
+await client.GetBestGhostUrl("ea1");
