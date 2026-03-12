@@ -1,10 +1,59 @@
-﻿// See https://aka.ms/new-console-template for more information
 using System;
-using TNRD.Zeepkist.GTR.Ghosting.Recording.Data;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using Zeepkist.Ai.GtrClient;
 
-Console.WriteLine("Hello, World!");
+namespace Zeepkist.Ai.Tester
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            try
+            {
+                RunTester().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Critical Error: {ex}");
+            }
+            
+            Console.WriteLine("Press any key to exit...");
+            // Console.ReadKey();
+        }
 
-GtrClient client = new GtrClient();
-string url = await client.GetBestGhostUrl("ea1");
-var points = await client.DownloadAndParseGhost(url);
+        static async Task RunTester()
+        {
+            Console.WriteLine("Tester Starting...");
+            
+            GtrClient.GtrClient client = new GtrClient.GtrClient();
+            string hash = "ea1";
+            
+            Console.WriteLine($"Fetching best ghost for hash: {hash}");
+            string url = await client.GetBestGhostUrl(hash);
+            
+            if (string.IsNullOrEmpty(url))
+            {
+                Console.WriteLine("No ghost URL found.");
+                return;
+            }
+
+            Console.WriteLine($"Found Ghost URL: {url}");
+            List<float[]> points = await client.DownloadAndParseGhost(url);
+            
+            if (points != null)
+            {
+                Console.WriteLine($"Successfully parsed {points.Count} points!");
+                if (points.Count > 0)
+                {
+                    float[] p = points[0];
+                    Console.WriteLine($"First point: x={p[0]}, y={p[1]}, z={p[2]}");
+                }
+            }
+            else
+            {
+                Console.WriteLine("Failed to parse points.");
+            }
+        }
+    }
+}
