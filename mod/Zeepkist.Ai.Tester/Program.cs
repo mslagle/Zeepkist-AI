@@ -39,15 +39,15 @@ namespace Zeepkist.Ai.Tester
             }
 
             Console.WriteLine($"Found Ghost URL: {url}");
-            List<float[]> points = await client.DownloadAndParseGhost(url);
+            List<Vector3> points = await client.DownloadAndParseGhost(url);
             
             if (points != null)
             {
                 Console.WriteLine($"Successfully parsed {points.Count} points!");
                 if (points.Count > 0)
                 {
-                    float[] p = points[0];
-                    Console.WriteLine($"First point: x={p[0]}, y={p[1]}, z={p[2]}");
+                    Vector3 p = points[0];
+                    Console.WriteLine($"First point: x={p.x}, y={p.y}, z={p.z}");
                 }
             }
             else

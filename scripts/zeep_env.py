@@ -92,9 +92,7 @@ class ZeepkistEnv(gym.Env):
             except socket.timeout:
                 if received_count > 0: 
                     continue # Keep waiting if we are mid-stream
-                else:
-                    # Send a dummy input to trigger mod if it's waiting? No, just wait.
-                    pass
+                break # Timeout
             except Exception as e:
                 print(f"Error receiving points: {e}")
                 break
@@ -102,7 +100,6 @@ class ZeepkistEnv(gym.Env):
         # Clean up and save
         valid_frames = [f for f in self.ghost_frames if f is not None]
         if len(valid_frames) > 0 and len(valid_frames) >= expected_count * 0.9: # Allow small loss
-            self.current_level_hash = expected_hash
             self.ghost_positions = np.array([f['p'] for f in valid_frames])
             print(f"Successfully received {len(valid_frames)} frames from mod.")
             
@@ -122,8 +119,8 @@ class ZeepkistEnv(gym.Env):
             new_hash = self.last_telemetry.get('LevelHash')
             if new_hash and new_hash != self.current_level_hash:
                 print(f"New level detected in telemetry: {new_hash}")
+                self.current_level_hash = new_hash
                 self.ghost_positions = None # Invalidate old ghost
-                # Don't call receive here, let reset() or step() handle it when GhostLoaded is True
                 
             return True
         except socket.timeout:
