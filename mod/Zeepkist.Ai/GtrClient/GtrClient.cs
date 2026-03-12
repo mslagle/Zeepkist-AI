@@ -61,15 +61,15 @@ namespace Zeepkist.Ai.GtrClient
             return null;
         }
 
-        public async Task<string> GetBestGhostUrl(string hash)
+        public async Task<string> GetBestGhostUrl(string hash, int checkCount = 100)
         {
             var request = new GraphQLRequest
             {
                 Query = """
-                    query GetBestGhost($hash: String!) {
+                    query GetBestGhost($hash: String!, $first: Int!) {
                       levels(filter: { hash: { equalTo: $hash } }) {
                         nodes {
-                          records(orderBy: TIME_ASC, first: 10) {
+                          records(orderBy: TIME_ASC, first: $first) {
                             nodes {
                               recordMedia {
                                 ghostUrl
@@ -94,7 +94,7 @@ namespace Zeepkist.Ai.GtrClient
                     {
                         // Pick a middle-ranked one as requested earlier
                         int count = records.Count;
-                        int indexToPick = count >= 5 ? 4 : 0;
+                        int indexToPick = count / 2;
                         string url = records[indexToPick].recordMedia?.ghostUrl;
                         if (!string.IsNullOrEmpty(url))
                         {
