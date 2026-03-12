@@ -56,58 +56,63 @@ class ZeepkistEnv(gym.Env):
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
 
-    def _receive_points_from_mod(self):
+    def _receive_points_from_mod(self, expected_hash):
         """Listens for ghost data chunks from the C# mod."""
-        print("Listening for ghost data from mod...")
+        print(f"Listening for ghost data from mod for level {expected_hash}...")
         self.ghost_frames = []
         expected_count = 0
         received_count = 0
-        level_hash = "unknown"
         
         timeout_start = time.time()
-        while time.time() - timeout_start < 5.0: # 5 second total window to receive ghost
+        while time.time() - timeout_start < 10.0: # 10 second total window
             try:
                 data, addr = self.points_socket.recvfrom(65535)
                 msg = json.loads(data.decode('utf-8'))
                 
                 if msg.get("Type") == "Metadata":
+                    received_hash = msg.get("LevelHash", "unknown")
+                    if received_hash != expected_hash:
+                        print(f"Warning: Received metadata for {received_hash} but expected {expected_hash}")
+                        continue
+                    
                     expected_count = msg.get("FrameCount", 0)
-                    level_hash = msg.get("LevelHash", "unknown")
-                    print(f"Receiving {expected_count} frames for level {level_hash}")
+                    print(f"Receiving {expected_count} frames...")
                     self.ghost_frames = [None] * expected_count
+                    received_count = 0
                 
                 elif msg.get("Type") == "Points":
                     points_chunk = msg.get("Points", [])
-                    # Find start index if sent, but our mod just sends sequential chunks
-                    # So we track received_count
                     for p in points_chunk:
                         if received_count < len(self.ghost_frames):
                             self.ghost_frames[received_count] = p
                             received_count += 1
                     
-                    if msg.get("IsLast") or received_count >= expected_count:
+                    if msg.get("IsLast") or (expected_count > 0 and received_count >= expected_count):
                         break
             except socket.timeout:
-                if received_count > 0: continue # Keep waiting if we started receiving
-                break
+                if received_count > 0: 
+                    continue # Keep waiting if we are mid-stream
+                else:
+                    # Send a dummy input to trigger mod if it's waiting? No, just wait.
+                    pass
             except Exception as e:
                 print(f"Error receiving points: {e}")
                 break
 
         # Clean up and save
         valid_frames = [f for f in self.ghost_frames if f is not None]
-        if len(valid_frames) > 0:
-            self.current_level_hash = level_hash
+        if len(valid_frames) > 0 and len(valid_frames) >= expected_count * 0.9: # Allow small loss
+            self.current_level_hash = expected_hash
             self.ghost_positions = np.array([f['p'] for f in valid_frames])
             print(f"Successfully received {len(valid_frames)} frames from mod.")
             
-            # Save JSON as requested
-            json_path = f"ghosts/{level_hash}.json"
+            json_path = f"ghosts/{expected_hash}.json"
             with open(json_path, 'w') as jf:
                 json.dump({'frames': valid_frames}, jf)
-            print(f"Saved ghost JSON to {json_path}")
+            return True
         else:
-            print("Failed to receive valid ghost frames from mod.")
+            print(f"Failed to receive valid ghost frames. Got {len(valid_frames)}/{expected_count}")
+            return False
 
     def _receive_telemetry(self):
         try:
@@ -116,8 +121,9 @@ class ZeepkistEnv(gym.Env):
             
             new_hash = self.last_telemetry.get('LevelHash')
             if new_hash and new_hash != self.current_level_hash:
-                print(f"New level detected: {new_hash}")
-                self._receive_points_from_mod()
+                print(f"New level detected in telemetry: {new_hash}")
+                self.ghost_positions = None # Invalidate old ghost
+                # Don't call receive here, let reset() or step() handle it when GhostLoaded is True
                 
             return True
         except socket.timeout:
@@ -136,8 +142,9 @@ class ZeepkistEnv(gym.Env):
         print("--- ENVIRONMENT RESET ---")
         self._send_input(0.0, False, False, reset=True)
         
+        # Wait for "not spawned"
         start_wait = time.time()
-        while time.time() - start_wait < 3.0:
+        while time.time() - start_wait < 2.0:
             if self._receive_telemetry():
                 if not self.last_telemetry.get('IsSpawned', False):
                     break
@@ -152,29 +159,34 @@ class ZeepkistEnv(gym.Env):
             except: pass
             sock.settimeout(original_timeout)
 
-        print("Waiting for player to spawn...")
-        spawned = False
+        print("Waiting for player to spawn and ghost to load...")
         start_wait = time.time()
         
-        while not spawned:
-            self._send_input(0.0, False, False, reset=False)
+        while True:
+            t = None
             if self._receive_telemetry():
-                if self.last_telemetry.get('IsSpawned', False) and 'Position' in self.last_telemetry:
-                    # We need ghost data before we can truly be "Ready"
-                    if self.ghost_positions is not None:
-                        spawned = True
+                t = self.last_telemetry
+            
+            level_hash = t.get('LevelHash', 'unknown') if t else 'unknown'
+            
+            # Send input with RequestGhost if we need the data
+            need_ghost = (self.ghost_positions is None or self.current_level_hash != level_hash)
+            self._send_input(0.0, False, False, reset=False, request_ghost=need_ghost)
+            
+            if t and t.get('IsSpawned', False) and t.get('GhostLoaded', False):
+                if need_ghost:
+                    if self._receive_points_from_mod(level_hash):
                         print("Ready! Player spawned and ghost data active.")
+                        break
                     else:
-                        print("Waiting for ghost data from mod...")
-                        self._receive_points_from_mod()
+                        print("Retrying ghost data reception...")
+                else:
+                    break # Already have it
             
-            if not spawned:
-                time.sleep(0.1)
-            
-            if time.time() - start_wait > 20.0:
-                print("Reset timeout, retrying...")
-                self._send_input(0.0, False, False, reset=True)
-                start_wait = time.time()
+            time.sleep(0.1)
+            if time.time() - start_wait > 30.0:
+                print("Reset timeout, retrying full reset...")
+                return self.reset()
 
         return self._get_obs(), {}
 
@@ -251,8 +263,14 @@ class ZeepkistEnv(gym.Env):
             reward -= 0.5 * brake_val
         return reward
 
-    def _send_input(self, steering, brake, arms_up, reset=False):
-        input_data = {"Steering": float(steering), "Brake": bool(brake), "ArmsUp": bool(arms_up), "Reset": bool(reset)}
+    def _send_input(self, steering, brake, arms_up, reset=False, request_ghost=False):
+        input_data = {
+            "Steering": float(steering),
+            "Brake": bool(brake),
+            "ArmsUp": bool(arms_up),
+            "Reset": bool(reset),
+            "RequestGhost": bool(request_ghost)
+        }
         msg = json.dumps(input_data).encode('utf-8')
         try: self.input_socket.sendto(msg, (self.host, self.input_port))
         except: pass

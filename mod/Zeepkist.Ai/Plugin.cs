@@ -45,6 +45,8 @@ namespace Zeepkist.Ai
         private static GhostVisualizer visualizer = null;
 
         private static GtrClient.GtrClient gtrClient;
+        private static List<Vector3> cachedPoints = null;
+        private static string cachedHash = "";
 
         private void Awake()
         {
@@ -69,6 +71,7 @@ namespace Zeepkist.Ai
                 if (newHash != currentLevelHash)
                 {
                     currentLevelHash = newHash;
+                    ghostLoaded = false;
                     Task.Run(() => FetchAndProcessGhost(currentLevelHash));
                 }
                 
@@ -102,6 +105,9 @@ namespace Zeepkist.Ai
 
                 List<Vector3> points = await gtrClient.DownloadAndParseGhost(url);
                 if (points == null) return;
+
+                cachedPoints = points;
+                cachedHash = hash;
 
                 Debug.Log($"[AI_DEBUG] Received {points.Count} points from GtrClient.");
 
@@ -147,7 +153,16 @@ namespace Zeepkist.Ai
             {
                 byte[] bytes = inputServer.EndReceive(res, ref inputEndPoint);
                 string json = Encoding.UTF8.GetString(bytes);
-                CurrentInput = JsonConvert.DeserializeObject<AiInput>(json);
+                var input = JsonConvert.DeserializeObject<AiInput>(json);
+                if (input != null)
+                {
+                    CurrentInput = input;
+                    if (CurrentInput.RequestGhost && cachedPoints != null && cachedHash != "")
+                    {
+                        // We use a separate thread so we don't block input processing
+                        Task.Run(() => SendPointsToPython(cachedPoints, cachedHash));
+                    }
+                }
             }
             catch { }
 
@@ -175,6 +190,8 @@ namespace Zeepkist.Ai
             SendTelemetry();
         }
 
+        private static bool ghostLoaded = false;
+
         private void SendTelemetry()
         {
             try
@@ -192,12 +209,13 @@ namespace Zeepkist.Ai
                         Speed = playerCar.rb.velocity.magnitude,
                         LocalGForce = new { x = playerCar.localGForce.x, y = playerCar.localGForce.y },
                         LevelHash = currentLevelHash,
-                        IsSpawned = true
+                        IsSpawned = true,
+                        GhostLoaded = ghostLoaded
                     };
                 }
                 else
                 {
-                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash };
+                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash, GhostLoaded = ghostLoaded };
                 }
 
                 string json = JsonConvert.SerializeObject(data);
@@ -218,22 +236,33 @@ namespace Zeepkist.Ai
 
         public static void SendPointsToPython(List<Vector3> points, string levelHash)
         {
-            if (points == null || points.Count == 0) return;
+            if (points == null || points.Count == 0)
+            {
+                Debug.LogWarning("[AI_DEBUG] No points to send to Python.");
+                return;
+            }
+
             try {
+                Debug.Log($"[AI_DEBUG] Sending metadata for {points.Count} points...");
                 var metadata = new { Type = "Metadata", LevelHash = levelHash, FrameCount = points.Count };
                 byte[] metaBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(metadata));
                 pointsClient.Send(metaBytes, metaBytes.Length, pointsEndPoint);
 
-                int chunkSize = 100;
+                System.Threading.Thread.Sleep(50); // Give Python time to prepare
+
+                int chunkSize = 50; // Smaller chunks to stay under MTU
                 for (int i = 0; i < points.Count; i += chunkSize) {
                     var chunk = points.Skip(i).Take(chunkSize).Select(p => new { p = new float[] { p.x, p.y, p.z } }).ToList();
                     var data = new { Type = "Points", Points = chunk, IsLast = (i + chunkSize >= points.Count) };
                     byte[] bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(data));
                     pointsClient.Send(bytes, bytes.Length, pointsEndPoint);
-                    System.Threading.Thread.Sleep(5); 
+                    System.Threading.Thread.Sleep(10); 
                 }
-                Debug.Log($"[AI_DEBUG] Sent {points.Count} points to Python.");
-            } catch { }
+                Debug.Log($"[AI_DEBUG] Successfully sent {points.Count} points to Python.");
+                ghostLoaded = true;
+            } catch (Exception ex) {
+                Debug.LogError($"[AI_DEBUG] Error sending points: {ex.Message}");
+            }
         }
 
         [HarmonyPatch(typeof(New_ControlCar), "Update")]
@@ -332,5 +361,6 @@ namespace Zeepkist.Ai
         public bool Brake;
         public bool ArmsUp;
         public bool Reset;
+        public bool RequestGhost;
     }
 }
