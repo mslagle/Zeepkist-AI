@@ -80,7 +80,7 @@ namespace Zeepkist.Ai.GtrClient
                       }
                     }
                  """,
-                Variables = new { hash = hash }
+                Variables = new { hash = hash, first = checkCount }
             };
 
             try
