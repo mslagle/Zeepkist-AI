@@ -2,39 +2,28 @@
 using System.IO;
 using System.IO.Compression;
 using EasyCompressor;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
+using TNRD.Zeepkist.GTR.Ghosting.Readers;
 
 namespace TNRD.Zeepkist.GTR.Ghosting.Readers;
 
 public class GhostReaderFactory
 {
-    private readonly ILogger<GhostReaderFactory> _logger;
-    private readonly IServiceProvider _provider;
-
-    public GhostReaderFactory(ILogger<GhostReaderFactory> logger, IServiceProvider provider)
-    {
-        _logger = logger;
-        _provider = provider;
-    }
-
     public IGhostReader GetReader(byte[] buffer)
     {
         int version = GetVersion(buffer);
-        _logger.LogInformation("Ghost version: {Version}", version);
 
         switch (version)
         {
             case 1:
-                return _provider.GetService<V1Reader>();
+                return new V1Reader();
             case 2:
-                return _provider.GetService<V2Reader>();
+                return new V2Reader();
             case 3:
-                return _provider.GetService<V3Reader>();
+                return new V3Reader();
             case 4:
-                return _provider.GetService<V4Reader>();
+                return new V4Reader();
             case 5:
-                return _provider.GetService<V5Reader>();
+                return new V5Reader();
             default:
                 throw new NotSupportedException($"Version {version} is not supported.");
         }

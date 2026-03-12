@@ -8,14 +8,9 @@ namespace TNRD.Zeepkist.GTR.Ghosting.Readers;
 
 public class V1Reader : GhostReaderBase<V1Ghost>
 {
-    public V1Reader(IServiceProvider provider) : base(provider)
-    {
-    }
-
     public override IGhost Read(byte[] data)
     {
         List<V1Ghost.Frame> frames = new();
-
         using MemoryStream ms = new(data);
         using (BinaryReader reader = new(ms))
         {
@@ -30,6 +25,7 @@ public class V1Reader : GhostReaderBase<V1Ghost>
             }
         }
 
-        return CreateGhost(frames);
+        return new V1Ghost(frames);
     }
 }
+

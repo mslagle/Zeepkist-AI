@@ -3,7 +3,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using EasyCompressor;
-using Microsoft.Extensions.Logging;
 using ProtoBuf;
 using TNRD.Zeepkist.GTR.Ghosting.Ghosts;
 using TNRD.Zeepkist.GTR.Ghosting.Recording.Data;
@@ -19,13 +18,6 @@ namespace TNRD.Zeepkist.GTR.Ghosting.Readers;
 
 public class V5Reader : GhostReaderBase<V5Ghost>
 {
-    private readonly ILogger<V5Reader> _logger;
-
-    public V5Reader(IServiceProvider provider, ILogger<V5Reader> logger) : base(provider)
-    {
-        _logger = logger;
-    }
-
     public override IGhost Read(byte[] data)
     {
         byte[] decompressed;
@@ -35,7 +27,7 @@ public class V5Reader : GhostReaderBase<V5Ghost>
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Failed to decompress ghost data");
+            Debug.LogError("Failed to decompress ghost data: " + e.Message);
             return null;
         }
 
@@ -47,10 +39,11 @@ public class V5Reader : GhostReaderBase<V5Ghost>
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Failed to deserialize ghost data");
+            Debug.LogError("Failed to deserialize ghost data: " + e.Message);
             return null;
         }
 
+        /*
         CosmeticIDs cosmetics = new()
         {
             color = deserializedGhost.Cosmetics.Color,
@@ -66,7 +59,7 @@ public class V5Reader : GhostReaderBase<V5Ghost>
             paraglider = deserializedGhost.Cosmetics.Paraglider,
             rearWheels = deserializedGhost.Cosmetics.RearWheels,
             zeepkist = deserializedGhost.Cosmetics.Zeepkist
-        };
+        };*/
 
         List<V5Ghost.Frame> frames = new();
 
@@ -106,11 +99,11 @@ public class V5Reader : GhostReaderBase<V5Ghost>
             previousFrame = frame;
         }
 
-        return CreateGhost(
+        return new V5Ghost(
             deserializedGhost.TaggedUsername,
             ColorUtilities.FromHexString(deserializedGhost.Color),
             deserializedGhost.SteamId,
-            cosmetics,
+            new CosmeticIDs(),
             frames);
     }
 

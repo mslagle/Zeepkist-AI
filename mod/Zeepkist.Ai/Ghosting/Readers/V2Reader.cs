@@ -8,10 +8,6 @@ namespace TNRD.Zeepkist.GTR.Ghosting.Readers;
 
 public class V2Reader : GhostReaderBase<V2Ghost>
 {
-    public V2Reader(IServiceProvider provider) : base(provider)
-    {
-    }
-
     public override IGhost Read(byte[] data)
     {
         List<V2Ghost.Frame> frames = new();
@@ -38,6 +34,6 @@ public class V2Reader : GhostReaderBase<V2Ghost>
             }
         }
 
-        return CreateGhost(steamId, soapboxId, hatId, colorId, frames);
+        return new V2Ghost(steamId, soapboxId, hatId, colorId, frames);
     }
 }

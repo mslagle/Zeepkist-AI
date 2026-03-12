@@ -7,28 +7,53 @@ using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
+using UnityEngine;
 using Zeepkist.Ai.GtrClient.Models;
+using TNRD.Zeepkist.GTR.Ghosting.Readers;
+using TNRD.Zeepkist.GTR.Ghosting.Ghosts;
 
 namespace Zeepkist.Ai.GtrClient
 {
     public class GtrClient
     {
         public string GtrUrl { get; set; }
-        public GraphQLHttpClient GraphClient { get; set; } 
+        public GraphQLHttpClient GraphClient { get; set; }
+        private static readonly HttpClient httpClient = new HttpClient();
+        private readonly GhostReaderFactory ghostReaderFactory = new GhostReaderFactory();
 
         public GtrClient()
         {
             this.GtrUrl = "https://graphql.zeepki.st";
-            var httpClient = new HttpClient();
-            httpClient.DefaultRequestHeaders.Add("User-Agent", "Zeepkist.Ai");
-            httpClient.Timeout = TimeSpan.FromSeconds(10);
-
-            var options = new GraphQLHttpClientOptions
+            var httpClientOptions = new GraphQLHttpClientOptions
             {
                 EndPoint = new Uri(this.GtrUrl)
             };
 
-            this.GraphClient = new GraphQLHttpClient(options, new NewtonsoftJsonSerializer(), httpClient);
+            this.GraphClient = new GraphQLHttpClient(httpClientOptions, new NewtonsoftJsonSerializer(), httpClient);
+        }
+
+        public async Task<List<Vector3>> DownloadAndParseGhost(string url)
+        {
+            try
+            {
+                //Debug.Log($"[GtrClient] Downloading ghost from {url}...");
+                byte[] ghostData = await httpClient.GetByteArrayAsync(url);
+                
+                //Debug.Log($"[GtrClient] Parsing ghost data ({ghostData.Length} bytes)...");
+                IGhostReader reader = ghostReaderFactory.GetReader(ghostData);
+                IGhost ghost = reader.Read(ghostData);
+                
+                if (ghost == null) return null;
+
+                List<Vector3> points = ghost.GetPositions();
+                //Debug.Log($"[GtrClient] Successfully parsed ghost with {points.Count} points.");
+                return points;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[GtrClient] Error downloading/parsing ghost: {ex.Message}");
+                return null;
+            }
         }
 
         public async Task<int?> GetLevelIdByHash(string hash)

@@ -6,12 +6,17 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.Http;
 using System.Text;
+using System.Threading.Tasks;
 using UnityEngine;
 using ZeepSDK.Racing;
 using ZeepSDK.Level;
 using Newtonsoft.Json;
 using System.Reflection;
+using Zeepkist.Ai.GtrClient;
+using TNRD.Zeepkist.GTR.Ghosting.Readers;
+using TNRD.Zeepkist.GTR.Ghosting.Ghosts;
 
 namespace Zeepkist.Ai
 {
@@ -39,6 +44,8 @@ namespace Zeepkist.Ai
         private static string currentLevelHash = "Unknown";
         private static GhostVisualizer visualizer = null;
 
+        private static GtrClient.GtrClient gtrClient;
+
         private void Awake()
         {
             Debug.Log("[AI_DEBUG] === Plugin.Awake() STARTING ===");
@@ -51,11 +58,19 @@ namespace Zeepkist.Ai
             InputPort = Config.Bind<int>("Network", "Input Port", 9091);
             PointsPort = Config.Bind<int>("Network", "Ghost Points Port", 9092);
 
+            gtrClient = new GtrClient.GtrClient();
+
             SetupNetwork();
 
             RacingApi.PlayerSpawned += () => {
                 playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
-                currentLevelHash = LevelApi.CurrentLevel?.UID ?? "Unknown";
+                string newHash = LevelApi.CurrentLevel?.UID ?? "Unknown";
+                
+                if (newHash != currentLevelHash)
+                {
+                    currentLevelHash = newHash;
+                    Task.Run(() => FetchAndProcessGhost(currentLevelHash));
+                }
                 
                 if (visualizer == null)
                 {
@@ -69,6 +84,41 @@ namespace Zeepkist.Ai
             RacingApi.WheelBroken += () => { playerCar = null; };
 
             Debug.Log($"[AI_DEBUG] Plugin fully initialized!");
+        }
+
+        private async Task FetchAndProcessGhost(string hash)
+        {
+            if (hash == "Unknown") return;
+
+            try
+            {
+                Debug.Log($"[AI_DEBUG] Fetching and parsing best ghost for {hash}...");
+                string url = await gtrClient.GetBestGhostUrl(hash);
+                if (string.IsNullOrEmpty(url))
+                {
+                    Debug.LogWarning($"[AI_DEBUG] No ghost found for {hash}");
+                    return;
+                }
+
+                List<Vector3> points = await gtrClient.DownloadAndParseGhost(url);
+                if (points == null) return;
+
+                Debug.Log($"[AI_DEBUG] Received {points.Count} points from GtrClient.");
+
+                // Update visualizer on main thread
+                if (visualizer != null && ShowGhostPath.Value)
+                {
+                    UnityMainThreadDispatcher.Instance().Enqueue(() => {
+                        visualizer.UpdateLine(points);
+                    });
+                }
+
+                SendPointsToPython(points, hash);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[AI_DEBUG] Error in FetchAndProcessGhost: {ex.Message}");
+            }
         }
 
         private void SetupNetwork()
@@ -210,6 +260,42 @@ namespace Zeepkist.Ai
                         __instance.ArmsUpAction2.buttonHeld = CurrentInput.ArmsUp;
                     }
                 }
+            }
+        }
+    }
+
+    public class UnityMainThreadDispatcher : MonoBehaviour
+    {
+        private static readonly Queue<Action> _executionQueue = new Queue<Action>();
+        private static UnityMainThreadDispatcher _instance = null;
+
+        public static UnityMainThreadDispatcher Instance()
+        {
+            if (_instance == null)
+            {
+                GameObject obj = new GameObject("UnityMainThreadDispatcher");
+                _instance = obj.AddComponent<UnityMainThreadDispatcher>();
+                DontDestroyOnLoad(obj);
+            }
+            return _instance;
+        }
+
+        public void Update()
+        {
+            lock (_executionQueue)
+            {
+                while (_executionQueue.Count > 0)
+                {
+                    _executionQueue.Dequeue().Invoke();
+                }
+            }
+        }
+
+        public void Enqueue(Action action)
+        {
+            lock (_executionQueue)
+            {
+                _executionQueue.Enqueue(action);
             }
         }
     }

@@ -1,4 +1,5 @@
-﻿using TNRD.Zeepkist.GTR.Ghosting.Playback;
+﻿using System.Collections.Generic;
+using TNRD.Zeepkist.GTR.Ghosting.Playback;
 using UnityEngine;
 
 namespace TNRD.Zeepkist.GTR.Ghosting.Ghosts;
@@ -84,6 +85,16 @@ public abstract class GhostBase : IGhost
     }
 
     protected abstract IFrame GetFrame(int index);
+
+    public List<Vector3> GetPositions()
+    {
+        List<Vector3> positions = new List<Vector3>();
+        for (int i = 0; i < FrameCount; i++)
+        {
+            positions.Add(GetFrame(i).Position);
+        }
+        return positions;
+    }
 
     public void Update()
     {
