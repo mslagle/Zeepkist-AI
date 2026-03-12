@@ -7,6 +7,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
+using Zeepkist.Ai.GtrClient.Models;
 
 namespace Zeepkist.Ai.GtrClient
 {
@@ -48,10 +49,10 @@ namespace Zeepkist.Ai.GtrClient
 
             try
             {
-                var response = await GraphClient.SendQueryAsync<dynamic>(request);
-                if (response.Data?.levels?.nodes?.Count > 0)
+                var response = await GraphClient.SendQueryAsync<GtrLevelsResponse>(request);
+                if (response.Data?.Levels?.Nodes?.Count > 0)
                 {
-                    return (int)response.Data.levels.nodes[0].id;
+                    return response.Data.Levels.Nodes[0].Id;
                 }
             }
             catch (Exception ex)
@@ -69,6 +70,7 @@ namespace Zeepkist.Ai.GtrClient
                     query GetBestGhost($hash: String!, $first: Int!) {
                       levels(filter: { hash: { equalTo: $hash } }) {
                         nodes {
+                          id
                           records(orderBy: TIME_ASC, first: $first) {
                             nodes {
                               recordMedia {
@@ -85,17 +87,17 @@ namespace Zeepkist.Ai.GtrClient
 
             try
             {
-                var response = await GraphClient.SendQueryAsync<dynamic>(request);
-                var nodes = response.Data?.levels?.nodes;
+                var response = await GraphClient.SendQueryAsync<GtrLevelsResponse>(request);
+                var nodes = response.Data?.Levels?.Nodes;
                 if (nodes != null && nodes.Count > 0)
                 {
-                    var records = nodes[0].records?.nodes;
+                    var records = nodes[0].Records?.Nodes;
                     if (records != null && records.Count > 0)
                     {
                         // Pick a middle-ranked one as requested earlier
                         int count = records.Count;
-                        int indexToPick = count / 2;
-                        string url = records[indexToPick].recordMedia?.ghostUrl;
+                        int indexToPick = count >= 5 ? 4 : 0;
+                        string url = records[indexToPick].RecordMedia?.GhostUrl;
                         if (!string.IsNullOrEmpty(url))
                         {
                             if (url.StartsWith("//")) url = "https:" + url;
@@ -109,20 +111,6 @@ namespace Zeepkist.Ai.GtrClient
                 Console.WriteLine("Error getting ghost URL: " + ex.Message);
             }
             return null;
-        }
-
-        // Keep the old one for compatibility with the tester for now
-        public async Task GetLevelByHash(string hash)
-        {
-            var id = await GetLevelIdByHash(hash);
-            if (id.HasValue)
-            {
-                Console.WriteLine($"Found level ID: {id.Value}");
-            }
-            else
-            {
-                Console.WriteLine("Level not found.");
-            }
         }
     }
 }
