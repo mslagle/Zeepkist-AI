@@ -43,6 +43,7 @@ namespace Zeepkist.Ai
         private static New_ControlCar playerCar = null;
         private static string currentLevelHash = "Unknown";
         private static GhostVisualizer visualizer = null;
+        private static string lastResetReason = "None";
 
         private static GtrClient.GtrClient gtrClient;
         private static List<Vector3> cachedPoints = null;
@@ -67,6 +68,7 @@ namespace Zeepkist.Ai
             RacingApi.PlayerSpawned += () => {
                 playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
                 string newHash = LevelApi.CurrentLevel?.UID ?? "Unknown";
+                lastResetReason = "None";
                 
                 if (newHash != currentLevelHash)
                 {
@@ -82,9 +84,18 @@ namespace Zeepkist.Ai
                 }
             };
 
-            RacingApi.Crashed += (reason) => { playerCar = null; };
-            RacingApi.CrossedFinishLine += (time) => { playerCar = null; };
-            RacingApi.WheelBroken += () => { playerCar = null; };
+            RacingApi.Crashed += (reason) => { 
+                playerCar = null; 
+                lastResetReason = "Crashed: " + reason;
+            };
+            RacingApi.CrossedFinishLine += (time) => { 
+                playerCar = null; 
+                lastResetReason = "Finished";
+            };
+            RacingApi.WheelBroken += () => { 
+                playerCar = null; 
+                lastResetReason = "Wheel Broken";
+            };
 
             Debug.Log($"[AI_DEBUG] Plugin fully initialized!");
         }
@@ -210,12 +221,13 @@ namespace Zeepkist.Ai
                         LocalGForce = new { x = playerCar.localGForce.x, y = playerCar.localGForce.y },
                         LevelHash = currentLevelHash,
                         IsSpawned = true,
-                        GhostLoaded = ghostLoaded
+                        GhostLoaded = ghostLoaded,
+                        ResetReason = lastResetReason
                     };
                 }
                 else
                 {
-                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash, GhostLoaded = ghostLoaded };
+                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash, GhostLoaded = ghostLoaded, ResetReason = lastResetReason };
                 }
 
                 string json = JsonConvert.SerializeObject(data);

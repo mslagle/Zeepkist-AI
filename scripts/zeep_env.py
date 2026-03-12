@@ -248,16 +248,29 @@ class ZeepkistEnv(gym.Env):
     def _calculate_reward(self, obs, brake_val):
         reward = 0.0
         speed = obs[13]
+        progress = obs[20] # 0.0 to 1.0
+        
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
-            reward += progress_gain * 5.0
+            
+            # Base reward per point. 
+            # Progression Multiplier: Start at 1.0x, end at 5.0x.
+            progression_mult = 1.0 + (progress * 4.0)
+            
+            reward += progress_gain * 5.0 * progression_mult
             self.max_ghost_index = self.last_ghost_index
+            
         if speed > 2.0:
             reward += 0.2 * speed
+            
         dist_2d = np.linalg.norm(obs[[14, 16]])
-        reward += max(0, 5.0 - (dist_2d / 10.0))
+        # Path Deviation Penalty: -1.0 reward for every unit away from the line
+        # This strongly discourages straying.
+        reward -= dist_2d * 1.0
+        
         if brake_val > 0.5:
             reward -= 0.5 * brake_val
+            
         return reward
 
     def _send_input(self, steering, brake, arms_up, reset=False, request_ghost=False):
@@ -280,25 +293,38 @@ class ZeepkistEnv(gym.Env):
         if not self._receive_telemetry():
             return self._get_obs(), -0.1, False, False, {}
 
-        if not self.last_telemetry.get('IsSpawned', False):
-            return self._get_obs(), -50.0, True, False, {}
-
+        terminated = False
+        truncated = False
         obs = self._get_obs()
         reward = self._calculate_reward(obs, brake_val)
         speed = obs[13]
-        terminated = False
-        truncated = False
         
-        if obs[1] < -50: terminated = True; reward -= 100.0
+        reason = self.last_telemetry.get('ResetReason', 'None')
+
+        if not self.last_telemetry.get('IsSpawned', False):
+            print(f"Episode End: Not Spawned (Reason: {reason})")
+            return obs, -50.0, True, False, {}
+
+        if obs[1] < -50: 
+            print("Episode End: Fell off map")
+            terminated = True; reward -= 100.0
+        
         dist_2d = np.linalg.norm(obs[[14, 16]])
-        if dist_2d > 300.0: terminated = True; reward -= 50.0
+        if dist_2d > 50.0: # Tightened from 300.0 to 50.0
+            print("Episode End: Too far from ghost")
+            terminated = True; reward -= 50.0
 
         if speed < 1.0:
             if self.stuck_start_time is None: self.stuck_start_time = time.time()
-            elif time.time() - self.stuck_start_time > 5.0: terminated = True; reward -= 30.0
+            elif time.time() - self.stuck_start_time > 5.0: 
+                print("Episode End: Stuck")
+                terminated = True; reward -= 30.0
         else: self.stuck_start_time = None
             
-        if self.steps_in_episode > 10000: truncated = True
+        if self.steps_in_episode > 10000: 
+            print("Episode End: Step limit reached")
+            truncated = True
+            
         return obs, reward, terminated, truncated, {}
 
     def close(self):
