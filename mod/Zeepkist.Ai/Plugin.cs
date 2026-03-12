@@ -265,7 +265,7 @@ namespace Zeepkist.Ai
                 int chunkSize = 50; // Smaller chunks to stay under MTU
                 for (int i = 0; i < points.Count; i += chunkSize) {
                     var chunk = points.Skip(i).Take(chunkSize).Select(p => new { p = new float[] { p.x, p.y, p.z } }).ToList();
-                    var data = new { Type = "Points", Points = chunk, IsLast = (i + chunkSize >= points.Count) };
+                    var data = new { Type = "Points", StartIndex = i, Points = chunk, IsLast = (i + chunkSize >= points.Count) };
                     byte[] bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(data));
                     pointsClient.Send(bytes, bytes.Length, pointsEndPoint);
                     System.Threading.Thread.Sleep(10); 

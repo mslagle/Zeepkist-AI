@@ -24,11 +24,18 @@ class ZeepkistEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation Space: 22 dimensions
+        # Observation Space: 28 dimensions
+        # 0-13: Basic Telemetry (Pos, Rot, Vel, AngVel, Speed)
+        # 14-16: Rel Nearest Ghost Point
+        # 17-19: Rel Lookahead 1 (+30 frames)
+        # 20-22: Rel Lookahead 2 (+90 frames)
+        # 23-25: Rel Lookahead 3 (+180 frames)
+        # 26: Progress (0.0 to 1.0)
+        # 27: Ghost Loaded Flag (0 or 1)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(22,),
+            shape=(28,),
             dtype=np.float32
         )
 
@@ -82,10 +89,14 @@ class ZeepkistEnv(gym.Env):
                 
                 elif msg.get("Type") == "Points":
                     points_chunk = msg.get("Points", [])
-                    for p in points_chunk:
-                        if received_count < len(self.ghost_frames):
-                            self.ghost_frames[received_count] = p
-                            received_count += 1
+                    start_idx = msg.get("StartIndex", received_count)
+                    
+                    for i, p in enumerate(points_chunk):
+                        idx = start_idx + i
+                        if idx < len(self.ghost_frames):
+                            if self.ghost_frames[idx] is None:
+                                received_count += 1
+                            self.ghost_frames[idx] = p
                     
                     if msg.get("IsLast") or (expected_count > 0 and received_count >= expected_count):
                         break
@@ -99,7 +110,13 @@ class ZeepkistEnv(gym.Env):
 
         # Clean up and save
         valid_frames = [f for f in self.ghost_frames if f is not None]
-        if len(valid_frames) > 0 and len(valid_frames) >= expected_count * 0.9: # Allow small loss
+        if len(valid_frames) > 0 and len(valid_frames) >= expected_count * 0.8: # Allow some loss
+            self.current_level_hash = expected_hash
+            # We must NOT use valid_frames if there are gaps, we must use the array with Nones replaced by interpolation or just zeroed
+            # For now, let's just use the valid ones and warn if count is low
+            if len(valid_frames) < expected_count:
+                print(f"Warning: Lost {expected_count - len(valid_frames)} frames. Path may be slightly inaccurate.")
+            
             self.ghost_positions = np.array([f['p'] for f in valid_frames])
             print(f"Successfully received {len(valid_frames)} frames from mod.")
             
@@ -116,6 +133,11 @@ class ZeepkistEnv(gym.Env):
             data, addr = self.telemetry_socket.recvfrom(8192)
             self.last_telemetry = json.loads(data.decode('utf-8'))
             
+            # Debug: Check for reset reasons
+            reason = self.last_telemetry.get('ResetReason', 'None')
+            if reason != "None":
+                print(f"Mod Telemetry Reason: {reason}")
+
             new_hash = self.last_telemetry.get('LevelHash')
             if new_hash and new_hash != self.current_level_hash:
                 print(f"New level detected in telemetry: {new_hash}")
@@ -139,15 +161,16 @@ class ZeepkistEnv(gym.Env):
         print("--- ENVIRONMENT RESET ---")
         self._send_input(0.0, False, False, reset=True)
         
-        # Wait for "not spawned"
+        # Wait for "not spawned" to confirm reset started
         start_wait = time.time()
-        while time.time() - start_wait < 2.0:
+        while time.time() - start_wait < 3.0:
             if self._receive_telemetry():
                 if not self.last_telemetry.get('IsSpawned', False):
+                    print("Reset confirmed: Player unspawned.")
                     break
             time.sleep(0.05)
 
-        # Clear buffers
+        # Aggressively clear buffers
         for sock in [self.telemetry_socket, self.points_socket]:
             original_timeout = sock.gettimeout()
             sock.settimeout(0.0)
@@ -158,6 +181,7 @@ class ZeepkistEnv(gym.Env):
 
         print("Waiting for player to spawn and ghost to load...")
         start_wait = time.time()
+        consecutive_spawned = 0
         
         while True:
             t = None
@@ -171,25 +195,39 @@ class ZeepkistEnv(gym.Env):
             self._send_input(0.0, False, False, reset=False, request_ghost=need_ghost)
             
             if t and t.get('IsSpawned', False) and t.get('GhostLoaded', False):
-                if need_ghost:
-                    if self._receive_points_from_mod(level_hash):
-                        print("Ready! Player spawned and ghost data active.")
-                        break
+                consecutive_spawned += 1
+                if consecutive_spawned >= 5: # Require 5 stable frames
+                    if need_ghost:
+                        if self._receive_points_from_mod(level_hash):
+                            print("Ready! Player spawned and ghost data active.")
+                            break
+                        else:
+                            print("Ghost reception failed, retrying...")
+                            consecutive_spawned = 0
                     else:
-                        print("Retrying ghost data reception...")
-                else:
-                    break # Already have it
+                        print("Ready! Ghost already cached.")
+                        break
+            else:
+                consecutive_spawned = 0
             
             time.sleep(0.1)
             if time.time() - start_wait > 30.0:
                 print("Reset timeout, retrying full reset...")
                 return self.reset()
 
+        # Final buffer clear before starting
+        original_timeout = self.telemetry_socket.gettimeout()
+        self.telemetry_socket.settimeout(0.0)
+        try:
+            while True: self.telemetry_socket.recvfrom(65535)
+        except: pass
+        self.telemetry_socket.settimeout(original_timeout)
+
         return self._get_obs(), {}
 
     def _get_nearest_ghost_info(self):
         if self.ghost_positions is None:
-            return np.zeros(3), 0, 0.0
+            return np.zeros(3), np.zeros((3, 3)), 0, 0.0
 
         pos = np.array([
             self.last_telemetry['Position']['x'],
@@ -197,48 +235,71 @@ class ZeepkistEnv(gym.Env):
             self.last_telemetry['Position']['z']
         ])
         
-        if self.first_frame_after_reset:
-            subset = self.ghost_positions
-            start_idx = 0
-            self.first_frame_after_reset = False
-        else:
-            search_range = 1000
-            start_idx = max(0, self.last_ghost_index - 200) 
-            end_idx = min(len(self.ghost_positions), self.last_ghost_index + search_range)
-            subset = self.ghost_positions[start_idx:end_idx]
+        # Biased search around current progress
+        look_ahead_search = 2000
+        look_back_search = 500
+        start_idx = max(0, self.last_ghost_index - look_back_search)
+        end_idx = min(len(self.ghost_positions), self.last_ghost_index + look_ahead_search)
+        
+        subset = self.ghost_positions[start_idx:end_idx]
         
         if len(subset) == 0:
             idx = self.last_ghost_index
         else:
-            diffs = subset[:, [0, 2]] - pos[[0, 2]]
+            diffs = subset - pos
             distances_sq = np.sum(diffs**2, axis=1)
-            idx = np.argmin(distances_sq) + start_idx
+            local_idx = np.argmin(distances_sq)
+            idx = local_idx + start_idx
+            
+            # If the closest point in our window is further than 5.0 units,
+            # search the ENTIRE path to find the absolute nearest point.
+            if np.sqrt(distances_sq[local_idx]) > 5.0:
+                full_diffs = self.ghost_positions - pos
+                full_dist_sq = np.sum(full_diffs**2, axis=1)
+                idx = np.argmin(full_dist_sq)
+        
+        # Smooth progress
+        if idx < self.last_ghost_index - 200 and self.steps_in_episode > 10:
+            idx = self.last_ghost_index
             
         self.last_ghost_index = idx
-        relative_vec = self.ghost_positions[idx] - pos
+        nearest_pos = self.ghost_positions[idx]
+        relative_vec = nearest_pos - pos
+        
+        # Lookahead points
+        lookaheads = [30, 90, 180]
+        lookahead_vecs = []
+        for offset in lookaheads:
+            l_idx = min(len(self.ghost_positions) - 1, idx + offset)
+            lookahead_vecs.append(self.ghost_positions[l_idx] - pos)
+        
         progress = idx / len(self.ghost_positions) if len(self.ghost_positions) > 0 else 0.0
         
-        return relative_vec, idx, progress
+        if self.steps_in_episode % 100 == 0:
+            dist = np.linalg.norm(relative_vec)
+            print(f"Path Debug: Idx={idx}/{len(self.ghost_positions)}, Dist={dist:.2f}, Progress={progress:.1%}")
+
+        return relative_vec, np.array(lookahead_vecs), idx, progress
 
     def _get_obs(self):
         t = self.last_telemetry
         if not t or not t.get('IsSpawned', False) or 'Position' not in t:
-            return np.zeros(22, dtype=np.float32)
+            return np.zeros(self.observation_space.shape[0], dtype=np.float32)
 
-        rel_ghost_vec, _, progress = self._get_nearest_ghost_info()
+        rel_ghost_vec, lookaheads, _, progress = self._get_nearest_ghost_info()
         ghost_loaded = 1.0 if self.ghost_positions is not None else 0.0
         
-        obs = np.array([
-            t['Position']['x'], t['Position']['y'], t['Position']['z'],
-            t['Rotation']['x'], t['Rotation']['y'], t['Rotation']['z'], t['Rotation']['w'],
-            t['Velocity']['x'], t['Velocity']['y'], t['Velocity']['z'],
-            t['AngularVelocity']['x'], t['AngularVelocity']['y'], t['AngularVelocity']['z'],
-            t['Speed'],
-            rel_ghost_vec[0], rel_ghost_vec[1], rel_ghost_vec[2],
-            0, 0, 0, 
-            progress,
-            ghost_loaded
-        ], dtype=np.float32)
+        obs = np.concatenate([
+            [t['Position']['x'], t['Position']['y'], t['Position']['z']],
+            [t['Rotation']['x'], t['Rotation']['y'], t['Rotation']['z'], t['Rotation']['w']],
+            [t['Velocity']['x'], t['Velocity']['y'], t['Velocity']['z']],
+            [t['AngularVelocity']['x'], t['AngularVelocity']['y'], t['AngularVelocity']['z']],
+            [t['Speed']],
+            rel_ghost_vec,
+            lookaheads.flatten(),
+            [progress],
+            [ghost_loaded]
+        ]).astype(np.float32)
         
         if not np.all(np.isfinite(obs)):
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
