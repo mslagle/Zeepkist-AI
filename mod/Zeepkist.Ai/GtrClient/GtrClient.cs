@@ -87,7 +87,7 @@ namespace Zeepkist.Ai.GtrClient
             return null;
         }
 
-        public async Task<string> GetBestGhostUrl(string hash, int checkCount = 100)
+        public async Task<string> GetBestGhostUrl(string hash, int checkCount = 1000)
         {
             var request = new GraphQLRequest
             {

@@ -41,21 +41,46 @@ public class V4Reader : GhostReaderBase<V4Ghost>
             byte precision = reader.ReadByte();
             int frameCount = reader.ReadInt32();
 
-            ResetFrame lastResetFrame = null;
-            List<DeltaFrame> deltaFrames = new();
+            Vector3 currentPosition = Vector3.zero;
 
             for (int i = 0; i < frameCount; i++)
             {
                 if (i % precision == 0 || i == frameCount - 1)
                 {
-                    (V4Ghost.Frame frame, ResetFrame resetFrame) = ReadResetFrame(reader, deltaFrames);
-                    frames.Add(frame);
-                    lastResetFrame = resetFrame;
+                    ResetFrame resetFrame = ResetFrame.Read(reader);
+                    currentPosition = new Vector3(resetFrame.PositionX, resetFrame.PositionY, resetFrame.PositionZ);
+                    
+                    frames.Add(new V4Ghost.Frame(
+                        resetFrame.Time,
+                        currentPosition,
+                        new Quaternion(
+                            ShortToFloat(resetFrame.RotationX),
+                            ShortToFloat(resetFrame.RotationY),
+                            ShortToFloat(resetFrame.RotationZ),
+                            ShortToFloat(resetFrame.RotationW)),
+                        resetFrame.Steering,
+                        resetFrame.Flags.HasFlag(Flags.ArmsUp),
+                        resetFrame.Flags.HasFlag(Flags.IsBraking)));
                 }
                 else
                 {
-                    List<V4Ghost.Frame> parsedFrames = ReadDeltaFrame(reader, deltaFrames, lastResetFrame);
-                    frames.AddRange(parsedFrames);
+                    DeltaFrame deltaFrame = DeltaFrame.Read(reader);
+                    currentPosition += new Vector3(
+                        ShortToFloat(deltaFrame.PositionX),
+                        ShortToFloat(deltaFrame.PositionY),
+                        ShortToFloat(deltaFrame.PositionZ));
+
+                    frames.Add(new V4Ghost.Frame(
+                        deltaFrame.Time,
+                        currentPosition,
+                        new Quaternion(
+                            ShortToFloat(deltaFrame.RotationX, 30000),
+                            ShortToFloat(deltaFrame.RotationY, 30000),
+                            ShortToFloat(deltaFrame.RotationZ, 30000),
+                            ShortToFloat(deltaFrame.RotationW, 30000)),
+                        deltaFrame.Steering,
+                        deltaFrame.Flags.HasFlag(Flags.ArmsUp),
+                        deltaFrame.Flags.HasFlag(Flags.IsBraking)));
                 }
             }
         }
@@ -66,69 +91,6 @@ public class V4Reader : GhostReaderBase<V4Ghost>
         }
 
         return new V4Ghost(steamId, soapboxId, hatId, colorId, frames);
-    }
-
-    private static (V4Ghost.Frame, ResetFrame) ReadResetFrame(BinaryReader reader, List<DeltaFrame> deltaFrames)
-    {
-        ResetFrame lastResetFrame = ResetFrame.Read(reader);
-        deltaFrames.Clear();
-
-        return (new V4Ghost.Frame(
-                lastResetFrame.Time,
-                new Vector3(
-                    lastResetFrame.PositionX,
-                    lastResetFrame.PositionY,
-                    lastResetFrame.PositionZ),
-                new Quaternion(
-                    ShortToFloat(lastResetFrame.RotationX),
-                    ShortToFloat(lastResetFrame.RotationY),
-                    ShortToFloat(lastResetFrame.RotationZ),
-                    ShortToFloat(lastResetFrame.RotationW)),
-                lastResetFrame.Steering,
-                lastResetFrame.Flags.HasFlag(Flags.ArmsUp),
-                lastResetFrame.Flags.HasFlag(Flags.IsBraking)),
-            lastResetFrame);
-    }
-
-    private static List<V4Ghost.Frame> ReadDeltaFrame(
-        BinaryReader reader,
-        List<DeltaFrame> deltaFrames,
-        ResetFrame lastResetFrame)
-    {
-        DeltaFrame deltaFrame = DeltaFrame.Read(reader);
-        deltaFrames.Add(deltaFrame);
-
-        List<V4Ghost.Frame> frames = new();
-
-        Vector3 position = new Vector3(
-            lastResetFrame.PositionX,
-            lastResetFrame.PositionY,
-            lastResetFrame.PositionZ);
-
-        foreach (DeltaFrame frame in deltaFrames)
-        {
-            position += new Vector3(
-                ShortToFloat(frame.PositionX),
-                ShortToFloat(frame.PositionY),
-                ShortToFloat(frame.PositionZ));
-
-            Vector4 rotation = new(
-                ShortToFloat(frame.RotationX, 30000),
-                ShortToFloat(frame.RotationY, 30000),
-                ShortToFloat(frame.RotationZ, 30000),
-                ShortToFloat(frame.RotationW, 30000));
-
-            frames.Add(
-                new V4Ghost.Frame(
-                    frame.Time,
-                    position,
-                    new Quaternion(rotation.x, rotation.y, rotation.z, rotation.w),
-                    frame.Steering,
-                    frame.Flags.HasFlag(Flags.ArmsUp),
-                    frame.Flags.HasFlag(Flags.IsBraking)));
-        }
-
-        return frames;
     }
 
     private static bool IsGZipped(byte[] buffer)
