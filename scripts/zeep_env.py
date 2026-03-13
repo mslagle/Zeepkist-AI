@@ -24,18 +24,19 @@ class ZeepkistEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation Space: 28 dimensions
+        # Observation Space: 33 dimensions
         # 0-13: Basic Telemetry (Pos, Rot, Vel, AngVel, Speed)
         # 14-16: Rel Nearest Ghost Point
-        # 17-19: Rel Lookahead 1 (+30 frames)
-        # 20-22: Rel Lookahead 2 (+90 frames)
-        # 23-25: Rel Lookahead 3 (+180 frames)
+        # 17-19: Rel Lookahead 1 (+20 frames)
+        # 20-22: Rel Lookahead 2 (+50 frames)
+        # 23-25: Rel Lookahead 3 (+100 frames)
         # 26: Progress (0.0 to 1.0)
         # 27: Ghost Loaded Flag (0 or 1)
+        # 28-32: Raycasts (5 distances)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(28,),
+            shape=(33,),
             dtype=np.float32
         )
 
@@ -299,7 +300,8 @@ class ZeepkistEnv(gym.Env):
             rel_ghost_vec,
             lookaheads.flatten(),
             [progress],
-            [ghost_loaded]
+            [ghost_loaded],
+            rays
         ]).astype(np.float32)
         
         if not np.all(np.isfinite(obs)):
@@ -311,6 +313,7 @@ class ZeepkistEnv(gym.Env):
         reward = 0.0
         speed = obs[13]
         progress = obs[26] # 0.0 to 1.0
+        rays = obs[28:33]
         
         # 1. Progress Reward
         progress_reward = 0.0
@@ -336,16 +339,33 @@ class ZeepkistEnv(gym.Env):
         reward -= path_penalty
         
         # 4. Steering Magnitude Penalty (Steering bleeds speed)
-        steering_penalty = abs(steering) * 0.2 # Increased from 0.1
+        steering_penalty = abs(steering) * 0.2
         reward -= steering_penalty
 
-        # 5. Smoothness Penalty (New: Punish rapid wheel twitching)
+        # 5. Smoothness Penalty (Punish rapid wheel twitching)
         steering_change = abs(steering - self.last_steering)
-        smoothness_penalty = steering_change * 2.0 # High penalty for sudden changes
+        smoothness_penalty = steering_change * 2.0
         reward -= smoothness_penalty
         self.last_steering = steering
 
-        # 6. Braking Penalty
+        # 6. Proximity Penalty (Avoid clipping objects)
+        # Rays: [0:Forward, 1:F-Right, 2:F-Left, 3:Right, 4:Left]
+        proximity_threshold = min(10.0, 2.0 + (speed * 0.1))
+        proximity_penalty = 0.0
+        weights = [1.0, 0.8, 0.8, 0.3, 0.3] # Lower weight for sides to allow tighter lines
+        
+        for i, r_dist in enumerate(rays):
+            if r_dist < proximity_threshold:
+                # Quadratic penalty: (penetration / threshold)^2
+                # This makes the penalty very small at the edge of the bubble
+                # but extremely large as the AI gets closer to impact.
+                depth = proximity_threshold - r_dist
+                normalized_depth = depth / proximity_threshold
+                proximity_penalty += (normalized_depth ** 2) * 20.0 * weights[i]
+                
+        reward -= proximity_penalty
+
+        # 7. Braking Penalty
         brake_penalty = 0.0
         if brake_val > 0.5:
             brake_penalty = 0.5 * brake_val
@@ -353,7 +373,7 @@ class ZeepkistEnv(gym.Env):
             
         # Periodic Summary (every 500 steps)
         if self.steps_in_episode % 500 == 0:
-            print(f"  [REWARD STATS] Speed: +{speed_bonus:.2f}, Path: -{path_penalty:.2f}, Smoothness: -{smoothness_penalty:.2f}, Steering: -{steering_penalty:.2f}, Brake: -{brake_penalty:.2f}")
+            print(f"  [REWARD STATS] Speed: +{speed_bonus:.2f}, Path: -{path_penalty:.2f}, Smoothness: -{smoothness_penalty:.2f}, Proximity: -{proximity_penalty:.2f}")
             
         return reward
 

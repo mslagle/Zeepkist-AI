@@ -203,6 +203,18 @@ namespace Zeepkist.Ai
 
         private static bool ghostLoaded = false;
 
+        private float GetRaycast(Vector3 direction, float maxDist)
+        {
+            if (playerCar == null) return maxDist;
+            RaycastHit hit;
+            // Layer mask 1 is usually Default (environment)
+            if (Physics.Raycast(playerCar.transform.position + Vector3.up * 0.5f, direction, out hit, maxDist, 1))
+            {
+                return hit.distance;
+            }
+            return maxDist;
+        }
+
         private void SendTelemetry()
         {
             try
@@ -210,11 +222,13 @@ namespace Zeepkist.Ai
                 object data;
                 if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null)
                 {
+                    float maxRay = 40f;
+                    var transform = playerCar.transform;
                     data = new
                     {
                         Time = Time.time,
-                        Position = new { x = playerCar.transform.position.x, y = playerCar.transform.position.y, z = playerCar.transform.position.z },
-                        Rotation = new { x = playerCar.transform.rotation.x, y = playerCar.transform.rotation.y, z = playerCar.transform.rotation.z, w = playerCar.transform.rotation.w },
+                        Position = new { x = transform.position.x, y = transform.position.y, z = transform.position.z },
+                        Rotation = new { x = transform.rotation.x, y = transform.rotation.y, z = transform.rotation.z, w = transform.rotation.w },
                         Velocity = new { x = playerCar.rb.velocity.x, y = playerCar.rb.velocity.y, z = playerCar.rb.velocity.z },
                         AngularVelocity = new { x = playerCar.rb.angularVelocity.x, y = playerCar.rb.angularVelocity.y, z = playerCar.rb.angularVelocity.z },
                         Speed = playerCar.rb.velocity.magnitude,
@@ -222,7 +236,14 @@ namespace Zeepkist.Ai
                         LevelHash = currentLevelHash,
                         IsSpawned = true,
                         GhostLoaded = ghostLoaded,
-                        ResetReason = lastResetReason
+                        ResetReason = lastResetReason,
+                        Rays = new float[] {
+                            GetRaycast(transform.forward, maxRay),
+                            GetRaycast(transform.forward + transform.right * 0.5f, maxRay),
+                            GetRaycast(transform.forward - transform.right * 0.5f, maxRay),
+                            GetRaycast(transform.right, 10f),
+                            GetRaycast(-transform.right, 10f)
+                        }
                     };
                 }
                 else
