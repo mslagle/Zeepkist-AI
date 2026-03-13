@@ -59,6 +59,7 @@ class ZeepkistEnv(gym.Env):
         self.steps_in_episode = 0
         self.stuck_start_time = None
         self.first_frame_after_reset = True
+        self.last_steering = 0.0 # Track for smoothness
         
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
@@ -319,8 +320,9 @@ class ZeepkistEnv(gym.Env):
             progress_reward = progress_gain * 5.0 * progression_mult
             reward += progress_reward
             self.max_ghost_index = self.last_ghost_index
-            # Log progress gain immediately as it's a key milestone
-            print(f"  [REWARD] Progress: +{progress_reward:.1f} (Gain: {progress_gain}, Mult: {progression_mult:.1f}x)")
+            # Log progress gain periodically
+            if self.steps_in_episode % 500 == 0:
+                print(f"  [REWARD] Progress: +{progress_reward:.1f} (Gain: {progress_gain}, Mult: {progression_mult:.1f}x)")
             
         # 2. Speed Bonus
         speed_bonus = 0.0
@@ -333,20 +335,25 @@ class ZeepkistEnv(gym.Env):
         path_penalty = dist_2d * 1.0
         reward -= path_penalty
         
-        # 4. Steering Penalty (Steering bleeds speed in Zeepkist)
-        # Small penalty to encourage smoothness
-        steering_penalty = abs(steering) * 0.1
+        # 4. Steering Magnitude Penalty (Steering bleeds speed)
+        steering_penalty = abs(steering) * 0.2 # Increased from 0.1
         reward -= steering_penalty
 
-        # 5. Braking Penalty
+        # 5. Smoothness Penalty (New: Punish rapid wheel twitching)
+        steering_change = abs(steering - self.last_steering)
+        smoothness_penalty = steering_change * 2.0 # High penalty for sudden changes
+        reward -= smoothness_penalty
+        self.last_steering = steering
+
+        # 6. Braking Penalty
         brake_penalty = 0.0
         if brake_val > 0.5:
             brake_penalty = 0.5 * brake_val
             reward -= brake_penalty
             
-        # Periodic Summary (every 100 steps)
-        if self.steps_in_episode % 100 == 0:
-            print(f"  [REWARD STATS] Speed: +{speed_bonus:.2f}, Path: -{path_penalty:.2f}, Steering: -{steering_penalty:.2f}, Brake: -{brake_penalty:.2f}")
+        # Periodic Summary (every 500 steps)
+        if self.steps_in_episode % 500 == 0:
+            print(f"  [REWARD STATS] Speed: +{speed_bonus:.2f}, Path: -{path_penalty:.2f}, Smoothness: -{smoothness_penalty:.2f}, Steering: -{steering_penalty:.2f}, Brake: -{brake_penalty:.2f}")
             
         return reward
 
