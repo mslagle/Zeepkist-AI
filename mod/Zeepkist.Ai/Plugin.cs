@@ -40,9 +40,10 @@ namespace Zeepkist.Ai
         private static IPEndPoint pointsEndPoint;
 
         public static AiInput CurrentInput { get; private set; } = new AiInput();
-        private static New_ControlCar playerCar = null;
+        public static New_ControlCar playerCar = null;
         private static string currentLevelHash = "Unknown";
         private static GhostVisualizer visualizer = null;
+        private static RaycastVisualizer rayVisualizer = null;
         private static string lastResetReason = "None";
 
         private static GtrClient.GtrClient gtrClient;
@@ -72,8 +73,11 @@ namespace Zeepkist.Ai
                 
                 if (newHash != currentLevelHash)
                 {
+                    Debug.Log($"[AI_DEBUG] Level change detected: {currentLevelHash} -> {newHash}. Resetting state.");
                     currentLevelHash = newHash;
                     ghostLoaded = false;
+                    cachedPoints = null;
+                    cachedHash = "";
                     Task.Run(() => FetchAndProcessGhost(currentLevelHash));
                 }
                 
@@ -81,6 +85,12 @@ namespace Zeepkist.Ai
                 {
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
                     visualizer = vizObj.AddComponent<GhostVisualizer>();
+                }
+
+                if (rayVisualizer == null)
+                {
+                    GameObject rayObj = new GameObject("AI_RayVisualizer");
+                    rayVisualizer = rayObj.AddComponent<RaycastVisualizer>();
                 }
             };
 
@@ -202,18 +212,34 @@ namespace Zeepkist.Ai
         }
 
         private static bool ghostLoaded = false;
+private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
+{
+    if (playerCar == null) return maxDist;
 
-        private float GetRaycast(Vector3 direction, float maxDist)
+    Vector3 origin = playerCar.transform.position + Vector3.up * 0.5f;
+    RaycastHit hit;
+    float dist = maxDist;
+    bool isObstacle = false;
+
+    if (Physics.Raycast(origin, direction, out hit, maxDist))
+    {
+        // Filter: Only count it as an obstacle if the surface is NOT flat ground.
+        // A wall has a horizontal normal (low Y), ground has a vertical normal (high Y).
+        if (Mathf.Abs(hit.normal.y) < 0.8f) 
         {
-            if (playerCar == null) return maxDist;
-            RaycastHit hit;
-            // Layer mask 1 is usually Default (environment)
-            if (Physics.Raycast(playerCar.transform.position + Vector3.up * 0.5f, direction, out hit, maxDist, 1))
-            {
-                return hit.distance;
-            }
-            return maxDist;
+            dist = hit.distance;
+            isObstacle = true;
         }
+    }
+
+    if (rayVisualizer != null && index >= 0)
+    {
+        rayVisualizer.UpdateRay(index, origin, origin + direction * dist, isObstacle);
+    }
+
+    return dist;
+}
+
 
         private void SendTelemetry()
         {
@@ -224,6 +250,13 @@ namespace Zeepkist.Ai
                 {
                     float maxRay = 40f;
                     var transform = playerCar.transform;
+                    
+                    float r0 = GetRaycast(transform.forward, maxRay, 0);
+                    float r1 = GetRaycast(transform.forward + transform.right * 0.5f, maxRay, 1);
+                    float r2 = GetRaycast(transform.forward - transform.right * 0.5f, maxRay, 2);
+                    float r3 = GetRaycast(transform.right, 10f, 3);
+                    float r4 = GetRaycast(-transform.right, 10f, 4);
+
                     data = new
                     {
                         Time = Time.time,
@@ -237,13 +270,7 @@ namespace Zeepkist.Ai
                         IsSpawned = true,
                         GhostLoaded = ghostLoaded,
                         ResetReason = lastResetReason,
-                        Rays = new float[] {
-                            GetRaycast(transform.forward, maxRay),
-                            GetRaycast(transform.forward + transform.right * 0.5f, maxRay),
-                            GetRaycast(transform.forward - transform.right * 0.5f, maxRay),
-                            GetRaycast(transform.right, 10f),
-                            GetRaycast(-transform.right, 10f)
-                        }
+                        Rays = new float[] { r0, r1, r2, r3, r4 }
                     };
                 }
                 else
@@ -391,6 +418,53 @@ namespace Zeepkist.Ai
             if (points == null) return;
             line.positionCount = points.Count;
             line.SetPositions(points.ToArray());
+        }
+    }
+
+    public class RaycastVisualizer : MonoBehaviour
+    {
+        private LineRenderer[] lines;
+        private const int RayCount = 5;
+
+        private void Awake()
+        {
+            lines = new LineRenderer[RayCount];
+            for (int i = 0; i < RayCount; i++)
+            {
+                GameObject lineObj = new GameObject($"RayLine_{i}");
+                lineObj.transform.SetParent(this.transform);
+                LineRenderer lr = lineObj.AddComponent<LineRenderer>();
+                lr.useWorldSpace = true;
+                lr.startWidth = 0.1f;
+                lr.endWidth = 0.1f;
+                lr.material = new Material(Shader.Find("Hidden/Internal-Colored"));
+                lr.material.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                lr.material.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                lr.material.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+                lr.material.SetInt("_ZWrite", 0);
+                lines[i] = lr;
+            }
+        }
+
+        public void UpdateRay(int index, Vector3 start, Vector3 end, bool hasHit)
+        {
+            if (index < 0 || index >= RayCount) return;
+            
+            lines[index].enabled = true;
+            lines[index].SetPosition(0, start);
+            lines[index].SetPosition(1, end);
+            
+            Color color = hasHit ? Color.red : Color.green;
+            lines[index].startColor = color;
+            lines[index].endColor = color;
+        }
+
+        private void Update()
+        {
+            if (Plugin.playerCar == null)
+            {
+                foreach (var line in lines) if (line != null) line.enabled = false;
+            }
         }
     }
 

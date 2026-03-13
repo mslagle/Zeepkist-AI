@@ -43,10 +43,21 @@ def train():
     venv = DummyVecEnv([make_env])
     
     stats_path = "../zeepkist_vec_normalize.pkl"
+    env = None
     if os.path.exists(stats_path):
-        print("Loading existing normalization stats...")
-        env = VecNormalize.load(stats_path, venv)
-    else:
+        print("Attempting to load existing normalization stats...")
+        try:
+            # We wrap this in a try-except to catch shape mismatches
+            env = VecNormalize.load(stats_path, venv)
+            print("Normalization stats loaded successfully.")
+        except Exception as e:
+            print(f"Normalization stats load failed: {e}. Observation space may have changed.")
+            backup_stats = f"../zeepkist_vec_normalize_failed_{int(time.time())}.pkl"
+            os.rename(stats_path, backup_stats)
+            env = None
+
+    if env is None:
+        print("Creating new normalization stats...")
         env = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
     model_path = "../zeepkist_ai_model"
@@ -68,7 +79,7 @@ def train():
                     raise ValueError("Model weights contain NaN")
             print("Model loaded successfully.")
         except Exception as e:
-            print(f"Model load failed: {e}")
+            print(f"Model load failed: {e}. This is likely due to a change in observation/action space.")
             backup_name = f"{model_path}_failed_{int(time.time())}.zip"
             if os.path.exists(model_path + ".zip"):
                 os.rename(model_path + ".zip", backup_name)

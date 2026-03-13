@@ -6,7 +6,6 @@ namespace TNRD.Zeepkist.GTR.Ghosting.Ghosts;
 
 public abstract class GhostBase : IGhost
 {
-    private int _updateFrame;
     private int _fixedUpdateFrame;
 
     protected abstract int FrameCount { get; }
@@ -53,7 +52,6 @@ public abstract class GhostBase : IGhost
 
     public void Start()
     {
-        _updateFrame = 0;
         _fixedUpdateFrame = 0;
 
         IFrame frame = GetFrame(0);
@@ -62,7 +60,6 @@ public abstract class GhostBase : IGhost
 
     public void Stop()
     {
-        _updateFrame = 0;
         _fixedUpdateFrame = 0;
     }
 

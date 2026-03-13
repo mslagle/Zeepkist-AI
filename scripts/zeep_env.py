@@ -141,10 +141,18 @@ class ZeepkistEnv(gym.Env):
                 print(f"Mod Telemetry Reason: {reason}")
 
             new_hash = self.last_telemetry.get('LevelHash')
-            if new_hash and new_hash != self.current_level_hash:
+            if (new_hash and new_hash != self.current_level_hash) or (self.current_level_hash is None):
                 print(f"New level detected in telemetry: {new_hash}")
                 self.current_level_hash = new_hash
                 self.ghost_positions = None # Invalidate old ghost
+                
+                # Clear points buffer for the new level
+                original_timeout = self.points_socket.gettimeout()
+                self.points_socket.settimeout(0.0)
+                try:
+                    while True: self.points_socket.recvfrom(65535)
+                except: pass
+                self.points_socket.settimeout(original_timeout)
                 
             return True
         except socket.timeout:
@@ -286,10 +294,13 @@ class ZeepkistEnv(gym.Env):
     def _get_obs(self):
         t = self.last_telemetry
         if not t or not t.get('IsSpawned', False) or 'Position' not in t:
-            return np.zeros(self.observation_space.shape[0], dtype=np.float32)
+            return np.zeros(33, dtype=np.float32)
 
         rel_ghost_vec, lookaheads, _, progress = self._get_nearest_ghost_info()
         ghost_loaded = 1.0 if self.ghost_positions is not None else 0.0
+        
+        # Rays from mod (or default if missing)
+        rays = t.get('Rays', [20.0, 20.0, 20.0, 10.0, 10.0])
         
         obs = np.concatenate([
             [t['Position']['x'], t['Position']['y'], t['Position']['z']],
@@ -367,9 +378,14 @@ class ZeepkistEnv(gym.Env):
 
         # 7. Braking Penalty
         brake_penalty = 0.0
-        if brake_val > 0.5:
-            brake_penalty = 0.5 * brake_val
-            reward -= brake_penalty
+        if brake_val > 0.1:
+            if speed < 20.0:
+                # Heavy penalty for braking at low speeds
+                brake_penalty = 10.0 * brake_val
+            else:
+                # Normal small penalty for braking
+                brake_penalty = 0.5 * brake_val
+        reward -= brake_penalty
             
         # Periodic Summary (every 500 steps)
         if self.steps_in_episode % 500 == 0:
