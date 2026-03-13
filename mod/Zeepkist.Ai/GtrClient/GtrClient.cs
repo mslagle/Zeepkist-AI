@@ -153,7 +153,7 @@ namespace Zeepkist.Ai.GtrClient
                     {
                         // Pick a middle-ranked one as requested earlier
                         int count = records.Count;
-                        int indexToPick = count >= 5 ? 4 : 0;
+                        int indexToPick = count / 2;
                         string url = records[indexToPick].RecordMedia?.GhostUrl;
                         if (!string.IsNullOrEmpty(url))
                         {
