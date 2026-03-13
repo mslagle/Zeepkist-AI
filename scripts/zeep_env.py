@@ -266,8 +266,8 @@ class ZeepkistEnv(gym.Env):
         nearest_pos = self.ghost_positions[idx]
         relative_vec = nearest_pos - pos
         
-        # Lookahead points
-        lookaheads = [5, 15, 30]
+        # Lookahead points (Downsampled by 10, so 2, 5, 10 = 20, 50, 100 original frames)
+        lookaheads = [2, 5, 10]
         lookahead_vecs = []
         for offset in lookaheads:
             l_idx = min(len(self.ghost_positions) - 1, idx + offset)
@@ -306,31 +306,47 @@ class ZeepkistEnv(gym.Env):
             
         return obs
 
-    def _calculate_reward(self, obs, brake_val):
+    def _calculate_reward(self, obs, steering, brake_val):
         reward = 0.0
         speed = obs[13]
-        progress = obs[20] # 0.0 to 1.0
+        progress = obs[26] # 0.0 to 1.0
         
+        # 1. Progress Reward
+        progress_reward = 0.0
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
-            
-            # Base reward per point. 
-            # Progression Multiplier: Start at 1.0x, end at 5.0x.
             progression_mult = 1.0 + (progress * 4.0)
-            
-            reward += progress_gain * 5.0 * progression_mult
+            progress_reward = progress_gain * 5.0 * progression_mult
+            reward += progress_reward
             self.max_ghost_index = self.last_ghost_index
+            # Log progress gain immediately as it's a key milestone
+            print(f"  [REWARD] Progress: +{progress_reward:.1f} (Gain: {progress_gain}, Mult: {progression_mult:.1f}x)")
             
+        # 2. Speed Bonus
+        speed_bonus = 0.0
         if speed > 2.0:
-            reward += 0.2 * speed
+            speed_bonus = 0.2 * speed
+            reward += speed_bonus
             
+        # 3. Path Deviation Penalty
         dist_2d = np.linalg.norm(obs[[14, 16]])
-        # Path Deviation Penalty: -1.0 reward for every unit away from the line
-        # This strongly discourages straying.
-        reward -= dist_2d * 1.0
+        path_penalty = dist_2d * 1.0
+        reward -= path_penalty
         
+        # 4. Steering Penalty (Steering bleeds speed in Zeepkist)
+        # Small penalty to encourage smoothness
+        steering_penalty = abs(steering) * 0.1
+        reward -= steering_penalty
+
+        # 5. Braking Penalty
+        brake_penalty = 0.0
         if brake_val > 0.5:
-            reward -= 0.5 * brake_val
+            brake_penalty = 0.5 * brake_val
+            reward -= brake_penalty
+            
+        # Periodic Summary (every 100 steps)
+        if self.steps_in_episode % 100 == 0:
+            print(f"  [REWARD STATS] Speed: +{speed_bonus:.2f}, Path: -{path_penalty:.2f}, Steering: -{steering_penalty:.2f}, Brake: -{brake_penalty:.2f}")
             
         return reward
 
@@ -357,28 +373,28 @@ class ZeepkistEnv(gym.Env):
         terminated = False
         truncated = False
         obs = self._get_obs()
-        reward = self._calculate_reward(obs, brake_val)
+        reward = self._calculate_reward(obs, steering, brake_val)
         speed = obs[13]
         
         reason = self.last_telemetry.get('ResetReason', 'None')
 
         if not self.last_telemetry.get('IsSpawned', False):
-            print(f"Episode End: Not Spawned (Reason: {reason})")
+            print(f"Episode End: Not Spawned (Reason: {reason}) | Final Penalty: -50.0")
             return obs, -50.0, True, False, {}
 
-        if obs[1] < -30: 
-            print("Episode End: Fell off map")
+        if obs[15] > 10.0: # Relative Y: ghost_y - pos_y > 10
+            print(f"Episode End: Fell off map (Drop: {obs[15]:.1f}) | Final Penalty: -100.0")
             terminated = True; reward -= 100.0
         
         dist_2d = np.linalg.norm(obs[[14, 16]])
-        if dist_2d > 30.0: # Tightened from 300.0 to 50.0
-            print("Episode End: Too far from ghost")
+        if dist_2d > 25.0: # Tightened from 30.0 to 25.0
+            print(f"Episode End: Too far from ghost (Dist: {dist_2d:.1f}) | Final Penalty: -50.0")
             terminated = True; reward -= 50.0
 
         if speed < 1.0:
             if self.stuck_start_time is None: self.stuck_start_time = time.time()
             elif time.time() - self.stuck_start_time > 5.0: 
-                print("Episode End: Stuck")
+                print("Episode End: Stuck | Final Penalty: -30.0")
                 terminated = True; reward -= 30.0
         else: self.stuck_start_time = None
             
