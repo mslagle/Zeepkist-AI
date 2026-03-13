@@ -267,7 +267,7 @@ class ZeepkistEnv(gym.Env):
         relative_vec = nearest_pos - pos
         
         # Lookahead points
-        lookaheads = [30, 90, 180]
+        lookaheads = [5, 15, 30]
         lookahead_vecs = []
         for offset in lookaheads:
             l_idx = min(len(self.ghost_positions) - 1, idx + offset)
@@ -366,12 +366,12 @@ class ZeepkistEnv(gym.Env):
             print(f"Episode End: Not Spawned (Reason: {reason})")
             return obs, -50.0, True, False, {}
 
-        if obs[1] < -50: 
+        if obs[1] < -30: 
             print("Episode End: Fell off map")
             terminated = True; reward -= 100.0
         
         dist_2d = np.linalg.norm(obs[[14, 16]])
-        if dist_2d > 50.0: # Tightened from 300.0 to 50.0
+        if dist_2d > 30.0: # Tightened from 300.0 to 50.0
             print("Episode End: Too far from ghost")
             terminated = True; reward -= 50.0
 

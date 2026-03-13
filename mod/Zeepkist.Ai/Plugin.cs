@@ -255,22 +255,29 @@ namespace Zeepkist.Ai
             }
 
             try {
-                Debug.Log($"[AI_DEBUG] Sending metadata for {points.Count} points...");
-                var metadata = new { Type = "Metadata", LevelHash = levelHash, FrameCount = points.Count };
+                // Downsample: Take every 10th point
+                List<Vector3> downsampled = new List<Vector3>();
+                for (int i = 0; i < points.Count; i += 10)
+                {
+                    downsampled.Add(points[i]);
+                }
+
+                Debug.Log($"[AI_DEBUG] Sending metadata for {downsampled.Count} downsampled points (Original: {points.Count})...");
+                var metadata = new { Type = "Metadata", LevelHash = levelHash, FrameCount = downsampled.Count };
                 byte[] metaBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(metadata));
                 pointsClient.Send(metaBytes, metaBytes.Length, pointsEndPoint);
 
-                System.Threading.Thread.Sleep(50); // Give Python time to prepare
+                System.Threading.Thread.Sleep(50); 
 
-                int chunkSize = 50; // Smaller chunks to stay under MTU
-                for (int i = 0; i < points.Count; i += chunkSize) {
-                    var chunk = points.Skip(i).Take(chunkSize).Select(p => new { p = new float[] { p.x, p.y, p.z } }).ToList();
-                    var data = new { Type = "Points", StartIndex = i, Points = chunk, IsLast = (i + chunkSize >= points.Count) };
+                int chunkSize = 50; 
+                for (int i = 0; i < downsampled.Count; i += chunkSize) {
+                    var chunk = downsampled.Skip(i).Take(chunkSize).Select(p => new { p = new float[] { p.x, p.y, p.z } }).ToList();
+                    var data = new { Type = "Points", StartIndex = i, Points = chunk, IsLast = (i + chunkSize >= downsampled.Count) };
                     byte[] bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(data));
                     pointsClient.Send(bytes, bytes.Length, pointsEndPoint);
                     System.Threading.Thread.Sleep(10); 
                 }
-                Debug.Log($"[AI_DEBUG] Successfully sent {points.Count} points to Python.");
+                Debug.Log($"[AI_DEBUG] Successfully sent {downsampled.Count} points to Python.");
                 ghostLoaded = true;
             } catch (Exception ex) {
                 Debug.LogError($"[AI_DEBUG] Error sending points: {ex.Message}");
