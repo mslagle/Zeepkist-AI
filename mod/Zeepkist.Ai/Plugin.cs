@@ -51,7 +51,7 @@ namespace Zeepkist.Ai
 
         private void Awake()
         {
-            Debug.Log("[AI_DEBUG] === Plugin.Awake() STARTING ===");
+            Logger.LogInfo("[AI_DEBUG] === Plugin.Awake() STARTING ===");
             harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
             harmony.PatchAll();
 
@@ -67,7 +67,7 @@ namespace Zeepkist.Ai
 
             RacingApi.PlayerSpawned += () => {
                 playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
-                string newHash = LevelApi.CurrentHash ?? "Unknown";
+                string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
                 lastResetReason = "None";
                 
                 if (newHash != currentLevelHash)
@@ -97,7 +97,7 @@ namespace Zeepkist.Ai
                 lastResetReason = "Wheel Broken";
             };
 
-            Debug.Log($"[AI_DEBUG] Plugin fully initialized!");
+            Logger.LogInfo($"[AI_DEBUG] Plugin fully initialized!");
         }
 
         private async Task FetchAndProcessGhost(string hash)
@@ -106,11 +106,11 @@ namespace Zeepkist.Ai
 
             try
             {
-                Debug.Log($"[AI_DEBUG] Fetching and parsing best ghost for {hash}...");
+                Logger.LogInfo($"[AI_DEBUG] Fetching and parsing best ghost for {hash}...");
                 string url = await gtrClient.GetBestGhostUrl(hash);
                 if (string.IsNullOrEmpty(url))
                 {
-                    Debug.LogWarning($"[AI_DEBUG] No ghost found for {hash}");
+                    Logger.LogError($"[AI_DEBUG] No ghost found for {hash}");
                     return;
                 }
 
@@ -120,7 +120,7 @@ namespace Zeepkist.Ai
                 cachedPoints = points;
                 cachedHash = hash;
 
-                Debug.Log($"[AI_DEBUG] Received {points.Count} points from GtrClient.");
+                Logger.LogInfo($"[AI_DEBUG] Received {points.Count} points from GtrClient.");
 
                 // Update visualizer on main thread
                 if (visualizer != null && ShowGhostPath.Value)
@@ -134,7 +134,7 @@ namespace Zeepkist.Ai
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[AI_DEBUG] Error in FetchAndProcessGhost: {ex.Message}");
+                Logger.LogError($"[AI_DEBUG] Error in FetchAndProcessGhost: {ex.Message}");
             }
         }
 
@@ -154,7 +154,7 @@ namespace Zeepkist.Ai
             }
             catch (Exception ex)
             {
-                Debug.LogError($"AI Network Setup Error: {ex.Message}");
+                Logger.LogError($"AI Network Setup Error: {ex.Message}");
             }
         }
 
@@ -246,11 +246,11 @@ namespace Zeepkist.Ai
             if (visualizer != null) Destroy(visualizer.gameObject);
         }
 
-        public static void SendPointsToPython(List<Vector3> points, string levelHash)
+        public void SendPointsToPython(List<Vector3> points, string levelHash)
         {
             if (points == null || points.Count == 0)
             {
-                Debug.LogWarning("[AI_DEBUG] No points to send to Python.");
+                Logger.LogError("[AI_DEBUG] No points to send to Python.");
                 return;
             }
 
@@ -262,7 +262,7 @@ namespace Zeepkist.Ai
                     downsampled.Add(points[i]);
                 }
 
-                Debug.Log($"[AI_DEBUG] Sending metadata for {downsampled.Count} downsampled points (Original: {points.Count})...");
+                Logger.LogInfo($"[AI_DEBUG] Sending metadata for {downsampled.Count} downsampled points (Original: {points.Count})...");
                 var metadata = new { Type = "Metadata", LevelHash = levelHash, FrameCount = downsampled.Count };
                 byte[] metaBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(metadata));
                 pointsClient.Send(metaBytes, metaBytes.Length, pointsEndPoint);
@@ -277,10 +277,10 @@ namespace Zeepkist.Ai
                     pointsClient.Send(bytes, bytes.Length, pointsEndPoint);
                     System.Threading.Thread.Sleep(10); 
                 }
-                Debug.Log($"[AI_DEBUG] Successfully sent {downsampled.Count} points to Python.");
+                Logger.LogInfo($"[AI_DEBUG] Successfully sent {downsampled.Count} points to Python.");
                 ghostLoaded = true;
             } catch (Exception ex) {
-                Debug.LogError($"[AI_DEBUG] Error sending points: {ex.Message}");
+                Logger.LogError($"[AI_DEBUG] Error sending points: {ex.Message}");
             }
         }
 
