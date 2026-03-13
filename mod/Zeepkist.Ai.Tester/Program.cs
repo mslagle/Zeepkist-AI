@@ -27,9 +27,10 @@ namespace Zeepkist.Ai.Tester
             Console.WriteLine("Tester Starting...");
             
             GtrClient.GtrClient client = new GtrClient.GtrClient();
-            string hash = "ea1";
+            string hash = "pg9xxqz70Ue4RG__[TOG]ioi8";
             
             Console.WriteLine($"Fetching best ghost for hash: {hash}");
+            int id = (int)await client.GetLevelIdByWorkshopId(3683603626);
             string url = await client.GetBestGhostUrl(hash);
             
             if (string.IsNullOrEmpty(url))
@@ -39,8 +40,9 @@ namespace Zeepkist.Ai.Tester
             }
 
             Console.WriteLine($"Found Ghost URL: {url}");
-            List<Vector3> points = await client.DownloadAndParseGhost(url);
+            var temp = await client.DownloadAndParseGhost(url);
             
+            /*
             if (points != null)
             {
                 Console.WriteLine($"Successfully parsed {points.Count} points!");
@@ -53,7 +55,7 @@ namespace Zeepkist.Ai.Tester
             else
             {
                 Console.WriteLine("Failed to parse points.");
-            }
+            }*/
         }
     }
 }

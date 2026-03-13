@@ -56,6 +56,38 @@ namespace Zeepkist.Ai.GtrClient
             }
         }
 
+        public async Task<int?> GetLevelIdByWorkshopId(float workshopId)
+        {
+            var request = new GraphQLRequest
+            {
+                Query = """
+                    query getLevelByWorkshop($workshopId: BigFloat!){
+                      levelItems(filter: { workshopId: { equalTo: $workshopId } }) {
+                        nodes {
+                          levelId
+                          id
+                        }
+                      }
+                    }
+                 """,
+                Variables = new { workshopId = workshopId }
+            };
+
+            try
+            {
+                var response = await GraphClient.SendQueryAsync<GtrLevelsResponse>(request);
+                if (response.Data?.Levels?.Nodes?.Count > 0)
+                {
+                    return response.Data.Levels.Nodes[0].Id;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error getting level ID: " + ex.Message);
+            }
+            return null;
+        }
+
         public async Task<int?> GetLevelIdByHash(string hash)
         {
             var request = new GraphQLRequest

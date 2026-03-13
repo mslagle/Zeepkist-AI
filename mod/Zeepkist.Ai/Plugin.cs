@@ -67,7 +67,7 @@ namespace Zeepkist.Ai
 
             RacingApi.PlayerSpawned += () => {
                 playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
-                string newHash = LevelApi.CurrentLevel?.UID ?? "Unknown";
+                string newHash = LevelApi.CurrentHash ?? "Unknown";
                 lastResetReason = "None";
                 
                 if (newHash != currentLevelHash)
