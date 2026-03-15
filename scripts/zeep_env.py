@@ -292,7 +292,6 @@ class ZeepkistEnv(gym.Env):
             print(f"Path Debug: Idx={idx}/{len(self.ghost_positions)}, Dist={dist:.2f}, Progress={progress:.1%}")
 
         return relative_vec, np.array(lookahead_vecs), idx, progress, target_positions
-, target_positions
 
     def _rotate_vector_to_local(self, world_vec, quat):
         """Rotates a world-space vector into the car's local coordinate system."""
@@ -440,7 +439,9 @@ class ZeepkistEnv(gym.Env):
         truncated = False
         obs = self._get_obs()
         reward = self._calculate_reward(obs, steering, brake_val)
-        speed = obs[13]
+        
+        # New Indices: 6 is Speed, 15 is Relative Y (Drop)
+        speed = obs[6]
         
         reason = self.last_telemetry.get('ResetReason', 'None')
 
@@ -448,12 +449,13 @@ class ZeepkistEnv(gym.Env):
             print(f"Episode End: Not Spawned (Reason: {reason}) | Final Penalty: -50.0")
             return obs, -50.0, True, False, {}
 
-        if obs[15] > 10.0: # Relative Y: ghost_y - pos_y > 10
-            print(f"Episode End: Fell off map (Drop: {obs[15]:.1f}) | Final Penalty: -100.0")
+        if obs[8] > 10.0: # Index 8 is local Y of the relative ghost vector (ghost_y - pos_y)
+            print(f"Episode End: Fell off map (Drop: {obs[8]:.1f}) | Final Penalty: -100.0")
             terminated = True; reward -= 100.0
         
-        dist_2d = np.linalg.norm(obs[[14, 16]])
-        if dist_2d > 25.0: # Tightened from 30.0 to 25.0
+        # dist_2d is now calculated from local X and Z (indices 7 and 9)
+        dist_2d = np.linalg.norm([obs[7], obs[9]])
+        if dist_2d > 25.0: 
             print(f"Episode End: Too far from ghost (Dist: {dist_2d:.1f}) | Final Penalty: -50.0")
             terminated = True; reward -= 50.0
 
