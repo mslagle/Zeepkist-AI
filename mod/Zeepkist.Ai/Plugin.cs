@@ -44,6 +44,7 @@ namespace Zeepkist.Ai
         private static string currentLevelHash = "Unknown";
         private static GhostVisualizer visualizer = null;
         private static RaycastVisualizer rayVisualizer = null;
+        private static TargetVisualizer targetVisualizer = null;
         private static string lastResetReason = "None";
 
         private static GtrClient.GtrClient gtrClient;
@@ -91,6 +92,12 @@ namespace Zeepkist.Ai
                 {
                     GameObject rayObj = new GameObject("AI_RayVisualizer");
                     rayVisualizer = rayObj.AddComponent<RaycastVisualizer>();
+                }
+
+                if (targetVisualizer == null)
+                {
+                    GameObject targetObj = new GameObject("AI_TargetVisualizer");
+                    targetVisualizer = targetObj.AddComponent<TargetVisualizer>();
                 }
             };
 
@@ -178,6 +185,14 @@ namespace Zeepkist.Ai
                 if (input != null)
                 {
                     CurrentInput = input;
+                    
+                    if (CurrentInput.TargetPositions != null && targetVisualizer != null)
+                    {
+                        UnityMainThreadDispatcher.Instance().Enqueue(() => {
+                            targetVisualizer.UpdateTargets(CurrentInput.TargetPositions);
+                        });
+                    }
+
                     if (CurrentInput.RequestGhost && cachedPoints != null && cachedHash != "")
                     {
                         // We use a separate thread so we don't block input processing
@@ -193,6 +208,56 @@ namespace Zeepkist.Ai
             }
             catch { }
         }
+...
+    public class TargetVisualizer : MonoBehaviour
+    {
+        private GameObject[] markers;
+        private Color[] colors = new Color[] { Color.yellow, Color.cyan, Color.white, Color.white };
+
+        private void Awake()
+        {
+            markers = new GameObject[4]; // 1 Nearest + 3 Lookaheads
+            for (int i = 0; i < 4; i++)
+            {
+                markers[i] = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                markers[i].name = $"TargetMarker_{i}";
+                markers[i].transform.SetParent(this.transform);
+                markers[i].transform.localScale = Vector3.one * 1.5f;
+                
+                // Remove collider so it doesn't hit raycasts
+                Destroy(markers[i].GetComponent<SphereCollider>());
+                
+                Renderer r = markers[i].GetComponent<Renderer>();
+                r.material = new Material(Shader.Find("Hidden/Internal-Colored"));
+                r.material.color = colors[i % colors.Length];
+            }
+        }
+
+        public void UpdateTargets(float[][] positions)
+        {
+            if (positions == null) return;
+            for (int i = 0; i < markers.Length; i++)
+            {
+                if (i < positions.Length)
+                {
+                    markers[i].SetActive(true);
+                    markers[i].transform.position = new Vector3(positions[i][0], positions[i][1], positions[i][2]);
+                }
+                else
+                {
+                    markers[i].SetActive(false);
+                }
+            }
+        }
+
+        private void Update()
+        {
+            if (Plugin.playerCar == null)
+            {
+                foreach (var m in markers) if (m != null) m.SetActive(false);
+            }
+        }
+    }
 
         private void FixedUpdate()
         {
@@ -476,5 +541,6 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
         public bool ArmsUp;
         public bool Reset;
         public bool RequestGhost;
+        public float[][] TargetPositions;
     }
 }

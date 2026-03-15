@@ -61,6 +61,7 @@ class ZeepkistEnv(gym.Env):
         self.stuck_start_time = None
         self.first_frame_after_reset = True
         self.last_steering = 0.0 # Track for smoothness
+        self.last_target_positions = [[0,0,0]]*4
         
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
@@ -237,7 +238,7 @@ class ZeepkistEnv(gym.Env):
 
     def _get_nearest_ghost_info(self):
         if self.ghost_positions is None:
-            return np.zeros(3), np.zeros((3, 3)), 0, 0.0
+            return np.zeros(3), np.zeros((3, 3)), 0, 0.0, [[0,0,0]]*4
 
         pos = np.array([
             self.last_telemetry['Position']['x'],
@@ -261,8 +262,7 @@ class ZeepkistEnv(gym.Env):
             local_idx = np.argmin(distances_sq)
             idx = local_idx + start_idx
             
-            # If the closest point in our window is further than 5.0 units,
-            # search the ENTIRE path to find the absolute nearest point.
+            # Fallback if window is lost
             if np.sqrt(distances_sq[local_idx]) > 5.0:
                 full_diffs = self.ghost_positions - pos
                 full_dist_sq = np.sum(full_diffs**2, axis=1)
@@ -279,9 +279,11 @@ class ZeepkistEnv(gym.Env):
         # Lookahead points (Downsampled by 10, so 2, 5, 10 = 20, 50, 100 original frames)
         lookaheads = [2, 5, 10]
         lookahead_vecs = []
+        target_positions = [nearest_pos.tolist()]
         for offset in lookaheads:
             l_idx = min(len(self.ghost_positions) - 1, idx + offset)
             lookahead_vecs.append(self.ghost_positions[l_idx] - pos)
+            target_positions.append(self.ghost_positions[l_idx].tolist())
         
         progress = idx / len(self.ghost_positions) if len(self.ghost_positions) > 0 else 0.0
         
@@ -289,30 +291,69 @@ class ZeepkistEnv(gym.Env):
             dist = np.linalg.norm(relative_vec)
             print(f"Path Debug: Idx={idx}/{len(self.ghost_positions)}, Dist={dist:.2f}, Progress={progress:.1%}")
 
-        return relative_vec, np.array(lookahead_vecs), idx, progress
+        return relative_vec, np.array(lookahead_vecs), idx, progress, target_positions
+, target_positions
+
+    def _rotate_vector_to_local(self, world_vec, quat):
+        """Rotates a world-space vector into the car's local coordinate system."""
+        # Unity Quat: [x, y, z, w]
+        # Conjugate for inverse rotation: [-x, -y, -z, w]
+        x, y, z, w = quat['x'], quat['y'], quat['z'], quat['w']
+        q_vec = np.array([-x, -y, -z])
+        v = np.array(world_vec)
+        
+        # v' = v + 2 * cross(q_vec, cross(q_vec, v) + w * v)
+        a = np.cross(q_vec, v) + w * v
+        return v + 2 * np.cross(q_vec, a)
 
     def _get_obs(self):
         t = self.last_telemetry
         if not t or not t.get('IsSpawned', False) or 'Position' not in t:
+            self.last_target_positions = [[0,0,0]]*4
             return np.zeros(33, dtype=np.float32)
 
-        rel_ghost_vec, lookaheads, _, progress = self._get_nearest_ghost_info()
+        car_quat = t['Rotation']
+        
+        # 1. Transform ghost vectors to Local Space
+        rel_near_world, lookaheads_world, idx, progress, target_positions = self._get_nearest_ghost_info()
+        self.last_target_positions = target_positions
+        
+        rel_near_local = self._rotate_vector_to_local(rel_near_world, car_quat)
+        lookaheads_local = np.array([self._rotate_vector_to_local(v, car_quat) for v in lookaheads_world])
+        
+        # 2. Transform Velocity to Local Space
+        vel_world = [t['Velocity']['x'], t['Velocity']['y'], t['Velocity']['z']]
+        vel_local = self._rotate_vector_to_local(vel_world, car_quat)
+        
+        # 3. Path Direction Awareness
+        # Get vector between current ghost point and next one to know path heading
+        next_idx = min(len(self.ghost_positions) - 1, idx + 1)
+        path_dir_world = self.ghost_positions[next_idx] - self.ghost_positions[idx]
+        if np.linalg.norm(path_dir_world) > 0.001:
+            path_dir_world /= np.linalg.norm(path_dir_world)
+        path_dir_local = self._rotate_vector_to_local(path_dir_world, car_quat)
+
         ghost_loaded = 1.0 if self.ghost_positions is not None else 0.0
+        rays = t.get('Rays', [40.0, 40.0, 40.0, 10.0, 10.0])
         
-        # Rays from mod (or default if missing)
-        rays = t.get('Rays', [20.0, 20.0, 20.0, 10.0, 10.0])
-        
+        # 33-dim observation (Local frame)
+        # 0-2: Local Vel, 3-5: Ang Vel, 6: Speed
+        # 7-9: Local Rel Near Ghost
+        # 10-18: Local Rel Lookaheads (3x3)
+        # 19-21: Local Path Direction
+        # 22: Progress, 23: Ghost Loaded, 24-28: Rays
+        # 29-32: Car Rotation (to sense Pitch/Roll)
         obs = np.concatenate([
-            [t['Position']['x'], t['Position']['y'], t['Position']['z']],
-            [t['Rotation']['x'], t['Rotation']['y'], t['Rotation']['z'], t['Rotation']['w']],
-            [t['Velocity']['x'], t['Velocity']['y'], t['Velocity']['z']],
+            vel_local,
             [t['AngularVelocity']['x'], t['AngularVelocity']['y'], t['AngularVelocity']['z']],
             [t['Speed']],
-            rel_ghost_vec,
-            lookaheads.flatten(),
+            rel_near_local,
+            lookaheads_local.flatten(),
+            path_dir_local,
             [progress],
             [ghost_loaded],
-            rays
+            rays,
+            [car_quat['x'], car_quat['y'], car_quat['z'], car_quat['w']]
         ]).astype(np.float32)
         
         if not np.all(np.isfinite(obs)):
@@ -322,74 +363,55 @@ class ZeepkistEnv(gym.Env):
 
     def _calculate_reward(self, obs, steering, brake_val):
         reward = 0.0
-        speed = obs[13]
-        progress = obs[26] # 0.0 to 1.0
-        rays = obs[28:33]
+        speed = obs[6]
+        # Local Rel Near is at index 7-9. 
+        # dist_2d is now calculated from local X and Z (ignoring vertical local Y)
+        dist_2d = np.linalg.norm([obs[7], obs[9]]) 
+        progress = obs[22]
+        rays = obs[24:29]
         
         # 1. Progress Reward
-        progress_reward = 0.0
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
             progression_mult = 1.0 + (progress * 4.0)
-            progress_reward = progress_gain * 5.0 * progression_mult
-            reward += progress_reward
+            reward += progress_gain * 5.0 * progression_mult
             self.max_ghost_index = self.last_ghost_index
-            # Log progress gain periodically
-            if self.steps_in_episode % 500 == 0:
-                print(f"  [REWARD] Progress: +{progress_reward:.1f} (Gain: {progress_gain}, Mult: {progression_mult:.1f}x)")
             
-        # 2. Speed Bonus
-        speed_bonus = 0.0
-        if speed > 2.0:
-            speed_bonus = 0.2 * speed
-            reward += speed_bonus
+        # 2. Speed Bonus (Only if moving forward relative to car)
+        local_forward_vel = obs[0] 
+        if local_forward_vel > 2.0:
+            reward += 0.2 * local_forward_vel
             
-        # 3. Path Deviation Penalty
-        dist_2d = np.linalg.norm(obs[[14, 16]])
-        path_penalty = dist_2d * 1.0
+        # 3. Path Deviation Penalty (Heavily Increased)
+        # Penalty is now -2.0 per unit to force adherence to the line
+        path_penalty = dist_2d * 2.0
         reward -= path_penalty
         
-        # 4. Steering Magnitude Penalty (Steering bleeds speed)
+        # 4. Steering Penalties
         steering_penalty = abs(steering) * 0.2
-        reward -= steering_penalty
-
-        # 5. Smoothness Penalty (Punish rapid wheel twitching)
         steering_change = abs(steering - self.last_steering)
         smoothness_penalty = steering_change * 2.0
-        reward -= smoothness_penalty
+        reward -= (steering_penalty + smoothness_penalty)
         self.last_steering = steering
 
-        # 6. Proximity Penalty (Avoid clipping objects)
-        # Rays: [0:Forward, 1:F-Right, 2:F-Left, 3:Right, 4:Left]
-        proximity_threshold = min(10.0, 2.0 + (speed * 0.1))
+        # 5. Proximity Penalty (Avoid clipping objects)
         proximity_penalty = 0.0
-        weights = [1.0, 0.8, 0.8, 0.3, 0.3] # Lower weight for sides to allow tighter lines
-        
+        proximity_threshold = min(10.0, 2.0 + (speed * 0.1))
+        weights = [1.0, 0.8, 0.8, 0.3, 0.3]
         for i, r_dist in enumerate(rays):
             if r_dist < proximity_threshold:
-                # Quadratic penalty: (penetration / threshold)^2
-                # This makes the penalty very small at the edge of the bubble
-                # but extremely large as the AI gets closer to impact.
                 depth = proximity_threshold - r_dist
-                normalized_depth = depth / proximity_threshold
-                proximity_penalty += (normalized_depth ** 2) * 20.0 * weights[i]
-                
+                proximity_penalty += ((depth / proximity_threshold) ** 2) * 30.0 * weights[i]
         reward -= proximity_penalty
 
-        # 7. Braking Penalty
+        # 6. Braking Penalty
         brake_penalty = 0.0
         if brake_val > 0.1:
-            if speed < 20.0:
-                # Heavy penalty for braking at low speeds
-                brake_penalty = 10.0 * brake_val
-            else:
-                # Normal small penalty for braking
-                brake_penalty = 0.5 * brake_val
+            brake_penalty = (10.0 if speed < 20.0 else 0.5) * brake_val
         reward -= brake_penalty
             
-        # Periodic Summary (every 500 steps)
         if self.steps_in_episode % 500 == 0:
-            print(f"  [REWARD STATS] Speed: +{speed_bonus:.2f}, Path: -{path_penalty:.2f}, Smoothness: -{smoothness_penalty:.2f}, Proximity: -{proximity_penalty:.2f}")
+            print(f"  [REWARD STATS] Speed: +{speed:.1f}, Path: -{path_penalty:.2f}, Smooth: -{smoothness_penalty:.2f}, Prox: -{proximity_penalty:.2f}")
             
         return reward
 
@@ -399,7 +421,8 @@ class ZeepkistEnv(gym.Env):
             "Brake": bool(brake),
             "ArmsUp": bool(arms_up),
             "Reset": bool(reset),
-            "RequestGhost": bool(request_ghost)
+            "RequestGhost": bool(request_ghost),
+            "TargetPositions": self.last_target_positions
         }
         msg = json.dumps(input_data).encode('utf-8')
         try: self.input_socket.sendto(msg, (self.host, self.input_port))
