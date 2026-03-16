@@ -27,7 +27,7 @@ namespace Zeepkist.Ai.Tester
             Console.WriteLine("Tester Starting...");
             
             GtrClient.GtrClient client = new GtrClient.GtrClient();
-            string hash = "EZ01";
+            string hash = "EZ02";
             
             Console.WriteLine($"Fetching best ghost for hash: {hash}");
             //int id = (int)await client.GetLevelIdByWorkshopId(3683603626);

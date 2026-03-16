@@ -152,9 +152,10 @@ namespace Zeepkist.Ai.GtrClient
                     if (records != null && records.Count > 0)
                     {
                         // Pick a middle-ranked one as requested earlier
-                        int count = records.Count;
+                        var recordsNotBlank = records.Where(x => x.RecordMedia?.GhostUrl != null).ToList();
+                        int count = recordsNotBlank.Count;
                         int indexToPick = count / 2;
-                        string url = records[indexToPick].RecordMedia?.GhostUrl;
+                        string url = recordsNotBlank[indexToPick].RecordMedia?.GhostUrl;
                         if (!string.IsNullOrEmpty(url))
                         {
                             if (url.StartsWith("//")) url = "https:" + url;

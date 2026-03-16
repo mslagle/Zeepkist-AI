@@ -361,56 +361,63 @@ class ZeepkistEnv(gym.Env):
         return obs
 
     def _calculate_reward(self, obs, steering, brake_val):
-        reward = 0.0
-        speed = obs[6]
-        # Local Rel Near is at index 7-9. 
-        # dist_2d is now calculated from local X and Z (ignoring vertical local Y)
-        dist_2d = np.linalg.norm([obs[7], obs[9]]) 
-        progress = obs[22]
-        rays = obs[24:29]
+        # Index Map:
+        # 0-2: Local Velocity (X: Side, Y: Up, Z: Forward)
+        # 3-5: Angular Velocity
+        # 6: Speed
+        # 7-9: Local Relative Near Ghost
+        # 19-21: Local Path Direction (Unit vector)
         
-        # 1. Progress Reward
+        reward = 0.0
+        local_vel = obs[0:3]
+        speed = obs[6]
+        rel_near_local = obs[7:10]
+        path_dir_local = obs[19:22]
+        
+        # 1. Track-Aligned Velocity (The most important reward)
+        # We reward speed that is going ALONG the path direction
+        # Dot product of local velocity and local path direction
+        alignment = np.dot(local_vel, path_dir_local)
+        if alignment > 0:
+            reward += alignment * 0.5
+        else:
+            reward -= 0.1 # Small penalty for moving backwards/sideways
+            
+        # 2. Path Proximity Bonus (Instead of a penalty)
+        # Max 2.0 bonus for being on the line, tapering off to 0 at 10 units away
+        dist_3d = np.linalg.norm(rel_near_local)
+        proximity_bonus = max(0, 2.0 * (1.0 - (dist_3d / 10.0)))
+        reward += proximity_bonus
+        
+        # 3. New Milestone Reward (Large burst for progress)
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
-            progression_mult = 1.0 + (progress * 4.0)
-            reward += progress_gain * 5.0 * progression_mult
+            reward += progress_gain * 10.0 # High value for reaching new points
             self.max_ghost_index = self.last_ghost_index
+
+        # 4. Smoothness & Control (Gentler penalties)
+        # Only penalize these if they are actually excessive
+        if abs(steering) > 0.8:
+            reward -= 0.1 * abs(steering)
             
-        # 2. Speed Bonus (Only if moving forward relative to car)
-        local_forward_vel = obs[0] 
-        if local_forward_vel > 2.0:
-            reward += 0.2 * local_forward_vel
-            
-        # 3. Path Deviation Penalty (Heavily Increased)
-        # Penalty is now -2.0 per unit to force adherence to the line
-        path_penalty = dist_2d * 2.0
-        reward -= path_penalty
-        
-        # 4. Steering Penalties
-        steering_penalty = abs(steering) * 0.2
         steering_change = abs(steering - self.last_steering)
-        smoothness_penalty = steering_change * 2.0
-        reward -= (steering_penalty + smoothness_penalty)
+        if steering_change > 0.1:
+            reward -= steering_change * 0.5 # Reduced from 2.0
         self.last_steering = steering
 
-        # 5. Proximity Penalty (Avoid clipping objects)
+        # 5. Collision Avoidance (Quadratic remains but slightly gentler)
+        rays = obs[24:29]
         proximity_penalty = 0.0
-        proximity_threshold = min(10.0, 2.0 + (speed * 0.1))
         weights = [1.0, 0.8, 0.8, 0.3, 0.3]
         for i, r_dist in enumerate(rays):
-            if r_dist < proximity_threshold:
-                depth = proximity_threshold - r_dist
-                proximity_penalty += ((depth / proximity_threshold) ** 2) * 30.0 * weights[i]
+            if r_dist < 5.0: # Detect closer obstacles
+                depth = (5.0 - r_dist) / 5.0
+                proximity_penalty += (depth ** 2) * 5.0 * weights[i]
         reward -= proximity_penalty
 
-        # 6. Braking Penalty
-        brake_penalty = 0.0
-        if brake_val > 0.1:
-            brake_penalty = (10.0 if speed < 20.0 else 0.5) * brake_val
-        reward -= brake_penalty
-            
-        if self.steps_in_episode % 500 == 0:
-            print(f"  [REWARD STATS] Speed: +{speed:.1f}, Path: -{path_penalty:.2f}, Smooth: -{smoothness_penalty:.2f}, Prox: -{proximity_penalty:.2f}")
+        # 6. Braking (Severe penalty for low speed braking remains)
+        if brake_val > 0.5 and speed < 15.0:
+            reward -= 5.0 * brake_val
             
         return reward
 
