@@ -49,6 +49,7 @@ namespace Zeepkist.Ai
         private static GtrClient.GtrClient gtrClient;
         private static List<Vector3> cachedPoints = null;
         private static string cachedHash = "";
+        private static bool isSendingPoints = false;
 
         private void Awake()
         {
@@ -193,10 +194,9 @@ namespace Zeepkist.Ai
                         });
                     }
 
-                    if (CurrentInput.RequestGhost && cachedPoints != null && cachedHash != "")
+                    if (CurrentInput.RequestGhost && cachedPoints != null && cachedHash != "" && !isSendingPoints)
                     {
-                        // We use a separate thread so we don't block input processing
-                        Task.Run(() => SendPointsToPython(cachedPoints, cachedHash));
+                        SendPointsToPython(cachedPoints, cachedHash);
                     }
                 }
             }
@@ -361,8 +361,9 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
 
         public void SendPointsToPython(List<Vector3> points, string levelHash)
         {
-            if (points == null || points.Count == 0) return;
+            if (points == null || points.Count == 0 || isSendingPoints) return;
 
+            isSendingPoints = true;
             Task.Run(() => {
                 try {
                     // Downsample: Take every 10th point
@@ -395,6 +396,8 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
                     }
                 } catch (Exception ex) {
                     Logger.LogError($"[AI_DEBUG] TCP Send Error: {ex.Message}");
+                } finally {
+                    isSendingPoints = false;
                 }
             });
         }

@@ -79,7 +79,7 @@ class ZeepkistEnv(gym.Env):
                 # 1. Read size (4 bytes)
                 size_data = s.recv(4)
                 if not size_data: return False
-                total_size = int.from_numpy(np.frombuffer(size_data, dtype=np.int32))[0]
+                total_size = int.from_bytes(size_data, byteorder='little')
                 
                 # 2. Read full JSON payload
                 chunks = []
@@ -187,7 +187,7 @@ class ZeepkistEnv(gym.Env):
             need_ghost = (self.ghost_positions is None or self.current_level_hash != level_hash)
             self._send_input(0.0, False, False, reset=False, request_ghost=need_ghost)
             
-            if t and t.get('IsSpawned', False) and t.get('GhostLoaded', False):
+            if t and t.get('IsSpawned', False):
                 consecutive_spawned += 1
                 if consecutive_spawned >= 5: # Require 5 stable frames
                     if need_ghost:
