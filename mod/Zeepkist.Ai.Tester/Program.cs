@@ -25,9 +25,11 @@ namespace Zeepkist.Ai.Tester
         static async Task RunTester()
         {
             Console.WriteLine("Tester Starting...");
-            
-            GtrClient.GtrClient client = new GtrClient.GtrClient();
-            string hash = "EZ02";
+
+            BepInEx.Logging.ManualLogSource logger = BepInEx.Logging.Logger.CreateLogSource("Tester");
+            GtrClient.GtrClient client = new GtrClient.GtrClient(logger);
+            string hash = "ea1";
+
             
             Console.WriteLine($"Fetching best ghost for hash: {hash}");
             //int id = (int)await client.GetLevelIdByWorkshopId(3683603626);

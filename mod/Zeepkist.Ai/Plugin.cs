@@ -30,14 +30,13 @@ namespace Zeepkist.Ai
         public static ConfigEntry<bool> ShowGhostPath { get; private set; }
         public static ConfigEntry<int> TelemetryPort { get; private set; }
         public static ConfigEntry<int> InputPort { get; private set; }
-        public static ConfigEntry<int> PointsPort { get; private set; }
+        public static ConfigEntry<int> PointsTcpPort { get; private set; }
 
         private static UdpClient telemetryClient;
         private static IPEndPoint telemetryEndPoint;
         private static UdpClient inputServer;
         private static IPEndPoint inputEndPoint;
-        private static UdpClient pointsClient;
-        private static IPEndPoint pointsEndPoint;
+        private static TcpListener pointsTcpListener;
 
         public static AiInput CurrentInput { get; private set; } = new AiInput();
         public static New_ControlCar playerCar = null;
@@ -61,9 +60,9 @@ namespace Zeepkist.Ai
             ShowGhostPath = Config.Bind<bool>("Visuals", "Show GTR Ghost Path", true);
             TelemetryPort = Config.Bind<int>("Network", "Telemetry Port", 9090);
             InputPort = Config.Bind<int>("Network", "Input Port", 9091);
-            PointsPort = Config.Bind<int>("Network", "Ghost Points Port", 9092);
+            PointsTcpPort = Config.Bind<int>("Network", "Ghost Points TCP Port", 9092);
 
-            gtrClient = new GtrClient.GtrClient();
+            gtrClient = new GtrClient.GtrClient(Logger);
 
             SetupNetwork();
 
@@ -166,8 +165,9 @@ namespace Zeepkist.Ai
                 inputEndPoint = new IPEndPoint(IPAddress.Any, InputPort.Value);
                 inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null);
 
-                pointsClient = new UdpClient();
-                pointsEndPoint = new IPEndPoint(IPAddress.Parse("127.0.0.1"), PointsPort.Value);
+                pointsTcpListener = new TcpListener(IPAddress.Parse("127.0.0.1"), PointsTcpPort.Value);
+                pointsTcpListener.Start();
+                Logger.LogInfo($"[AI_DEBUG] TCP Points Server started on port {PointsTcpPort.Value}");
             }
             catch (Exception ex)
             {
@@ -355,46 +355,48 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
             harmony?.UnpatchSelf();
             inputServer?.Close();
             telemetryClient?.Close();
-            pointsClient?.Close();
+            pointsTcpListener?.Stop();
             if (visualizer != null) Destroy(visualizer.gameObject);
         }
 
         public void SendPointsToPython(List<Vector3> points, string levelHash)
         {
-            if (points == null || points.Count == 0)
-            {
-                Logger.LogError("[AI_DEBUG] No points to send to Python.");
-                return;
-            }
+            if (points == null || points.Count == 0) return;
 
-            try {
-                // Downsample: Take every 10th point
-                List<Vector3> downsampled = new List<Vector3>();
-                for (int i = 0; i < points.Count; i += 10)
-                {
-                    downsampled.Add(points[i]);
+            Task.Run(() => {
+                try {
+                    // Downsample: Take every 10th point
+                    List<float[]> downsampled = new List<float[]>();
+                    for (int i = 0; i < points.Count; i += 10) {
+                        downsampled.Add(new float[] { points[i].x, points[i].y, points[i].z });
+                    }
+
+                    Logger.LogInfo($"[AI_DEBUG] Waiting for Python TCP connection to send {downsampled.Count} points...");
+                    
+                    using (TcpClient client = pointsTcpListener.AcceptTcpClient())
+                    using (NetworkStream stream = client.GetStream())
+                    {
+                        var data = new { 
+                            LevelHash = levelHash, 
+                            FrameCount = downsampled.Count, 
+                            Points = downsampled 
+                        };
+                        string json = JsonConvert.SerializeObject(data);
+                        byte[] bytes = Encoding.UTF8.GetBytes(json);
+                        
+                        // Send size first (4 bytes)
+                        byte[] sizeBytes = BitConverter.GetBytes(bytes.Length);
+                        stream.Write(sizeBytes, 0, 4);
+                        
+                        // Send data
+                        stream.Write(bytes, 0, bytes.Length);
+                        Logger.LogInfo($"[AI_DEBUG] Successfully sent all points over TCP.");
+                        ghostLoaded = true;
+                    }
+                } catch (Exception ex) {
+                    Logger.LogError($"[AI_DEBUG] TCP Send Error: {ex.Message}");
                 }
-
-                Logger.LogInfo($"[AI_DEBUG] Sending metadata for {downsampled.Count} downsampled points (Original: {points.Count})...");
-                var metadata = new { Type = "Metadata", LevelHash = levelHash, FrameCount = downsampled.Count };
-                byte[] metaBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(metadata));
-                pointsClient.Send(metaBytes, metaBytes.Length, pointsEndPoint);
-
-                System.Threading.Thread.Sleep(50); 
-
-                int chunkSize = 50; 
-                for (int i = 0; i < downsampled.Count; i += chunkSize) {
-                    var chunk = downsampled.Skip(i).Take(chunkSize).Select(p => new { p = new float[] { p.x, p.y, p.z } }).ToList();
-                    var data = new { Type = "Points", StartIndex = i, Points = chunk, IsLast = (i + chunkSize >= downsampled.Count) };
-                    byte[] bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(data));
-                    pointsClient.Send(bytes, bytes.Length, pointsEndPoint);
-                    System.Threading.Thread.Sleep(10); 
-                }
-                Logger.LogInfo($"[AI_DEBUG] Successfully sent {downsampled.Count} points to Python.");
-                ghostLoaded = true;
-            } catch (Exception ex) {
-                Logger.LogError($"[AI_DEBUG] Error sending points: {ex.Message}");
-            }
+            });
         }
 
         [HarmonyPatch(typeof(New_ControlCar), "Update")]

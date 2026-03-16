@@ -67,69 +67,51 @@ class ZeepkistEnv(gym.Env):
             os.makedirs("ghosts")
 
     def _receive_points_from_mod(self, expected_hash):
-        """Listens for ghost data chunks from the C# mod."""
-        print(f"Listening for ghost data from mod for level {expected_hash}...")
-        self.ghost_frames = []
-        expected_count = 0
-        received_count = 0
+        """Connects to the C# mod's TCP server to receive ghost data."""
+        print(f"Connecting to mod TCP server for level {expected_hash}...")
         
-        timeout_start = time.time()
-        while time.time() - timeout_start < 10.0: # 10 second total window
-            try:
-                data, addr = self.points_socket.recvfrom(65535)
-                msg = json.loads(data.decode('utf-8'))
+        try:
+            # Create a NEW TCP socket for this transfer
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(5.0)
+                s.connect((self.host, self.points_port))
                 
-                if msg.get("Type") == "Metadata":
-                    received_hash = msg.get("LevelHash", "unknown")
-                    if received_hash != expected_hash:
-                        print(f"Warning: Received metadata for {received_hash} but expected {expected_hash}")
-                        continue
-                    
-                    expected_count = msg.get("FrameCount", 0)
-                    print(f"Receiving {expected_count} frames...")
-                    self.ghost_frames = [None] * expected_count
-                    received_count = 0
+                # 1. Read size (4 bytes)
+                size_data = s.recv(4)
+                if not size_data: return False
+                total_size = int.from_numpy(np.frombuffer(size_data, dtype=np.int32))[0]
                 
-                elif msg.get("Type") == "Points":
-                    points_chunk = msg.get("Points", [])
-                    start_idx = msg.get("StartIndex", received_count)
+                # 2. Read full JSON payload
+                chunks = []
+                bytes_received = 0
+                while bytes_received < total_size:
+                    chunk = s.recv(min(total_size - bytes_received, 65536))
+                    if not chunk: break
+                    chunks.append(chunk)
+                    bytes_received += len(chunk)
+                
+                payload = b"".join(chunks).decode('utf-8')
+                msg = json.loads(payload)
+                
+                received_hash = msg.get("LevelHash", "unknown")
+                if received_hash != expected_hash:
+                    print(f"Warning: Received TCP data for {received_hash} but expected {expected_hash}")
+                    return False
+                
+                valid_frames = msg.get("Points", [])
+                if len(valid_frames) > 0:
+                    self.ghost_positions = np.array([f for f in valid_frames])
+                    print(f"Successfully received {len(valid_frames)} frames over TCP.")
                     
-                    for i, p in enumerate(points_chunk):
-                        idx = start_idx + i
-                        if idx < len(self.ghost_frames):
-                            if self.ghost_frames[idx] is None:
-                                received_count += 1
-                            self.ghost_frames[idx] = p
+                    json_path = f"ghosts/{expected_hash}.json"
+                    with open(json_path, 'w') as jf:
+                        json.dump({'frames': valid_frames}, jf)
+                    return True
                     
-                    if msg.get("IsLast") or (expected_count > 0 and received_count >= expected_count):
-                        break
-            except socket.timeout:
-                if received_count > 0: 
-                    continue # Keep waiting if we are mid-stream
-                break # Timeout
-            except Exception as e:
-                print(f"Error receiving points: {e}")
-                break
-
-        # Clean up and save
-        valid_frames = [f for f in self.ghost_frames if f is not None]
-        if len(valid_frames) > 0 and len(valid_frames) >= expected_count * 0.8: # Allow some loss
-            self.current_level_hash = expected_hash
-            # We must NOT use valid_frames if there are gaps, we must use the array with Nones replaced by interpolation or just zeroed
-            # For now, let's just use the valid ones and warn if count is low
-            if len(valid_frames) < expected_count:
-                print(f"Warning: Lost {expected_count - len(valid_frames)} frames. Path may be slightly inaccurate.")
+        except Exception as e:
+            print(f"TCP Point Reception Error: {e}")
             
-            self.ghost_positions = np.array([f['p'] for f in valid_frames])
-            print(f"Successfully received {len(valid_frames)} frames from mod.")
-            
-            json_path = f"ghosts/{expected_hash}.json"
-            with open(json_path, 'w') as jf:
-                json.dump({'frames': valid_frames}, jf)
-            return True
-        else:
-            print(f"Failed to receive valid ghost frames. Got {len(valid_frames)}/{expected_count}")
-            return False
+        return False
 
     def _receive_telemetry(self):
         try:

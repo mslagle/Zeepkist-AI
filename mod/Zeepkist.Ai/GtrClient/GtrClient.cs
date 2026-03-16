@@ -11,6 +11,7 @@ using UnityEngine;
 using Zeepkist.Ai.GtrClient.Models;
 using TNRD.Zeepkist.GTR.Ghosting.Readers;
 using TNRD.Zeepkist.GTR.Ghosting.Ghosts;
+using BepInEx.Logging;
 
 namespace Zeepkist.Ai.GtrClient
 {
@@ -20,9 +21,11 @@ namespace Zeepkist.Ai.GtrClient
         public GraphQLHttpClient GraphClient { get; set; }
         private static readonly HttpClient httpClient = new HttpClient();
         private readonly GhostReaderFactory ghostReaderFactory = new GhostReaderFactory();
+        private readonly ManualLogSource logger;
 
-        public GtrClient()
+        public GtrClient(ManualLogSource logger)
         {
+            this.logger = logger;
             this.GtrUrl = "https://graphql.zeepki.st";
             var httpClientOptions = new GraphQLHttpClientOptions
             {
@@ -36,22 +39,26 @@ namespace Zeepkist.Ai.GtrClient
         {
             try
             {
-                //Debug.Log($"[GtrClient] Downloading ghost from {url}...");
+                logger.LogInfo($"[GtrClient] Downloading ghost from {url}...");
                 byte[] ghostData = await httpClient.GetByteArrayAsync(url);
                 
-                //Debug.Log($"[GtrClient] Parsing ghost data ({ghostData.Length} bytes)...");
+                logger.LogInfo($"[GtrClient] Parsing ghost data ({ghostData.Length} bytes)...");
                 IGhostReader reader = ghostReaderFactory.GetReader(ghostData);
                 IGhost ghost = reader.Read(ghostData);
                 
-                if (ghost == null) return null;
+                if (ghost == null)
+                {
+                    logger.LogError("[GtrClient] Failed to parse ghost: reader.Read returned null.");
+                    return null;
+                }
 
                 List<Vector3> points = ghost.GetPositions();
-                //Debug.Log($"[GtrClient] Successfully parsed ghost with {points.Count} points.");
+                logger.LogInfo($"[GtrClient] Successfully parsed ghost with {points.Count} points.");
                 return points;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[GtrClient] Error downloading/parsing ghost: {ex.Message}");
+                logger.LogError($"[GtrClient] Error downloading/parsing ghost: {ex.Message}");
                 return null;
             }
         }
@@ -83,7 +90,7 @@ namespace Zeepkist.Ai.GtrClient
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Error getting level ID: " + ex.Message);
+                logger.LogError("[GtrClient] Error getting level ID: " + ex.Message);
             }
             return null;
         }
@@ -114,7 +121,7 @@ namespace Zeepkist.Ai.GtrClient
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Error getting level ID: " + ex.Message);
+                logger.LogError("[GtrClient] Error getting level ID: " + ex.Message);
             }
             return null;
         }
@@ -166,7 +173,7 @@ namespace Zeepkist.Ai.GtrClient
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Error getting ghost URL: " + ex.Message);
+                logger.LogError("[GtrClient] Error getting ghost URL: " + ex.Message);
             }
             return null;
         }
