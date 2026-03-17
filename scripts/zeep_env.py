@@ -24,7 +24,7 @@ class ZeepkistEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation Space: 41 dimensions
+        # Observation Space: 44 dimensions
         # 0-13: Basic Telemetry (Pos, Rot, Vel, AngVel, Speed)
         # 14-16: Rel Nearest Ghost Point
         # 17-19: Rel Lookahead 1 (+20 frames)
@@ -33,10 +33,13 @@ class ZeepkistEnv(gym.Env):
         # 26: Progress (0.0 to 1.0)
         # 27: Ghost Loaded Flag (0 or 1)
         # 28-40: Raycasts (13 distances)
+        # 41: Previous Steering Action
+        # 42: Is Slipping (Binary)
+        # 43: Surface Friction
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(41,),
+            shape=(44,),
             dtype=np.float32
         )
 
@@ -62,6 +65,7 @@ class ZeepkistEnv(gym.Env):
         self.first_frame_after_reset = True
         self.last_steering = 0.0 # Track for smoothness
         self.last_target_positions = [[0,0,0]]*4
+        self.start_training_time = time.time()
         
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
@@ -115,21 +119,67 @@ class ZeepkistEnv(gym.Env):
 
     def _receive_telemetry(self):
         try:
+            # 1. Receive raw bytes
             data, addr = self.telemetry_socket.recvfrom(8192)
-            self.last_telemetry = json.loads(data.decode('utf-8'))
+            if not data: return False
+            
+            # 2. Parse Binary Format (Matching mod's BinaryWriter order)
+            ptr = 0
+            def read_float():
+                nonlocal ptr
+                val = np.frombuffer(data[ptr:ptr+4], dtype=np.float32)[0]
+                ptr += 4
+                return float(val)
+            
+            def read_bool():
+                nonlocal ptr
+                val = data[ptr] != 0
+                ptr += 1
+                return val
+
+            def read_string():
+                nonlocal ptr
+                length = data[ptr]
+                ptr += 1
+                val = data[ptr:ptr+length].decode('utf-8')
+                ptr += length
+                return val
+
+            t = {}
+            t['Time'] = read_float()
+            t['Position'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
+            t['Rotation'] = {'x': read_float(), 'y': read_float(), 'z': read_float(), 'w': read_float()}
+            t['Velocity'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
+            t['AngularVelocity'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
+            t['Speed'] = read_float()
+            t['IsSpawned'] = read_bool()
+            t['GhostLoaded'] = read_bool()
+            t['CheckpointReached'] = read_bool()
+            
+            t['Rays'] = []
+            for _ in range(13):
+                t['Rays'].append(read_float())
+            
+            t['IsSlipping'] = read_bool()
+            t['SurfaceFriction'] = read_float()
+            
+            t['LevelHash'] = read_string()
+            t['ResetReason'] = read_string()
+            
+            self.last_telemetry = t
             
             # Debug: Check for reset reasons
-            reason = self.last_telemetry.get('ResetReason', 'None')
-            if reason != "None":
+            reason = t.get('ResetReason', 'None')
+            if reason != "None" and self.steps_in_episode % 500 == 0:
                 print(f"Mod Telemetry Reason: {reason}")
 
-            new_hash = self.last_telemetry.get('LevelHash')
+            new_hash = t.get('LevelHash')
             if (new_hash and new_hash != self.current_level_hash) or (self.current_level_hash is None):
                 print(f"New level detected in telemetry: {new_hash}")
                 self.current_level_hash = new_hash
-                self.ghost_positions = None # Invalidate old ghost
+                self.ghost_positions = None 
                 
-                # Clear points buffer for the new level
+                # Clear points buffer
                 original_timeout = self.points_socket.gettimeout()
                 self.points_socket.settimeout(0.0)
                 try:
@@ -138,8 +188,6 @@ class ZeepkistEnv(gym.Env):
                 self.points_socket.settimeout(original_timeout)
                 
             return True
-        except socket.timeout:
-            return False
         except Exception:
             return False
 
@@ -294,7 +342,7 @@ class ZeepkistEnv(gym.Env):
         t = self.last_telemetry
         if not t or not t.get('IsSpawned', False) or 'Position' not in t:
             self.last_target_positions = [[0,0,0]]*4
-            return np.zeros(33, dtype=np.float32)
+            return np.zeros(44, dtype=np.float32)
 
         car_quat = t['Rotation']
         
@@ -320,13 +368,7 @@ class ZeepkistEnv(gym.Env):
         ghost_loaded = 1.0 if self.ghost_positions is not None else 0.0
         rays = t.get('Rays', [40.0, 40.0, 40.0, 10.0, 10.0])
         
-        # 33-dim observation (Local frame)
-        # 0-2: Local Vel, 3-5: Ang Vel, 6: Speed
-        # 7-9: Local Rel Near Ghost
-        # 10-18: Local Rel Lookaheads (3x3)
-        # 19-21: Local Path Direction
-        # 22: Progress, 23: Ghost Loaded, 24-28: Rays
-        # 29-32: Car Rotation (to sense Pitch/Roll)
+        # 44-dim observation (Local frame)
         obs = np.concatenate([
             vel_local,
             [t['AngularVelocity']['x'], t['AngularVelocity']['y'], t['AngularVelocity']['z']],
@@ -337,8 +379,12 @@ class ZeepkistEnv(gym.Env):
             [progress],
             [ghost_loaded],
             rays,
-            [car_quat['x'], car_quat['y'], car_quat['z'], car_quat['w']]
+            [car_quat['x'], car_quat['y'], car_quat['z'], car_quat['w']],
+            [self.last_steering],
+            [1.0 if t.get('IsSlipping', False) else 0.0],
+            [t.get('SurfaceFriction', 1.0)]
         ]).astype(np.float32)
+
         
         if not np.all(np.isfinite(obs)):
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
@@ -346,12 +392,20 @@ class ZeepkistEnv(gym.Env):
         return obs
 
     def _calculate_reward(self, obs, steering, brake_val):
-        # Index Map (41 Dims):
-        # 0-2: Local Velocity, 3-5: Angular Velocity, 6: Speed
+        # Index Map (42 Dims):
+        # 0-2: Local Vel, 3-5: Ang Vel, 6: Speed
         # 7-9: Local Rel Near Ghost
-        # 10-18: Local Lookaheads (3x3)
-        # 19-21: Local Path Direction
-        # 22: Progress, 23: Ghost Loaded, 24-36: 13 Rays, 37-40: Quat
+        # 10-18: Lookaheads, 19-21: Path Dir, 22: Progress
+        # 23: Ghost Loaded, 24-36: Rays, 37-40: Quat, 41: Prev Steering
+        
+        # We need to update this logic to use the new dimensions correctly. 
+        # Wait, the previous dimension count was 44 in my head but 42 here.
+        # Let me re-verify. 
+        # concatenate: vel(3), ang(3), speed(1), rel(3), look(9), path(3), 
+        # prog(1), loaded(1), rays(13), quat(4), prev_steer(1) = 42. Correct.
+        
+        # Let's add Slipping(1) and Friction(1) to make it 44 as planned.
+        # But first let's fix the 42-dim logic.
         
         reward = 0.0
         local_vel = obs[0:3]
@@ -360,67 +414,78 @@ class ZeepkistEnv(gym.Env):
         path_dir_local = obs[19:22]
         rays = obs[24:37]
         
-        # 1. Track-Aligned Velocity (The most important reward)
-        # We reward speed that is going ALONG the path direction
-        # Dot product of local velocity and local path direction
+        # 1. Track-Aligned Velocity
         alignment = np.dot(local_vel, path_dir_local)
         if alignment > 0:
             reward += alignment * 0.5
         else:
-            reward -= 0.1 # Small penalty for moving backwards/sideways
+            reward -= 0.1 
             
-        # 2. Path Proximity Bonus (Instead of a penalty)
-        # Max 2.0 bonus for being on the line, tapering off to 0 at 10 units away
+        # 2. Path Proximity Bonus
         dist_3d = np.linalg.norm(rel_near_local)
         proximity_bonus = max(0, 2.0 * (1.0 - (dist_3d / 10.0)))
         reward += proximity_bonus
         
-        # 3. New Milestone Reward (Large burst for progress)
+        # 3. New Milestone Reward
         if self.last_ghost_index > self.max_ghost_index:
             progress_gain = self.last_ghost_index - self.max_ghost_index
-            reward += progress_gain * 10.0 # High value for reaching new points
+            reward += progress_gain * 10.0
             self.max_ghost_index = self.last_ghost_index
 
-        # 4. Smoothness & Control (Gentler penalties)
-        # Only penalize these if they are actually excessive
-        if abs(steering) > 0.8:
-            reward -= 0.1 * abs(steering)
-            
+        # 4. Smoothness & Control
+        # Speed-scaled magnitude penalty
+        speed_factor = 1.0 + (speed / 50.0)
+        steering_penalty = abs(steering) * 0.2 * speed_factor
+        
+        # Quadratic change penalty
         steering_change = abs(steering - self.last_steering)
-        if steering_change > 0.1:
-            reward -= steering_change * 0.5 # Reduced from 2.0
+        smoothness_penalty = (steering_change ** 2) * 5.0
+        
+        reward -= (steering_penalty + smoothness_penalty)
         self.last_steering = steering
 
         # 5. Collision Avoidance (13 Rays)
-        # Scale threshold based on speed to match the new 100-unit vision
         proximity_threshold = min(30.0, 3.0 + (speed * 0.3))
         proximity_penalty = 0.0
-        # Weights for 13 rays: more focus on the front
-        # Angles: -90, -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 90
         weights = [0.2, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 1.0, 0.9, 0.7, 0.5, 0.3, 0.2]
-        
         for i, r_dist in enumerate(rays):
             if r_dist < proximity_threshold:
                 depth = (proximity_threshold - r_dist) / proximity_threshold
                 proximity_penalty += (depth ** 2) * 10.0 * weights[i]
         reward -= proximity_penalty
 
-        # 6. Braking (Severe penalty for low speed braking remains)
+        # 6. Braking Penalty
         if brake_val > 0.5 and speed < 15.0:
             reward -= 5.0 * brake_val
             
         return reward
 
     def _send_input(self, steering, brake, arms_up, reset=False, request_ghost=False):
+        import struct
+        # Binary Input Format:
+        # [0-3]: Steering (float)
+        # [4]: Brake (bool)
+        # [5]: ArmsUp (bool)
+        # [6]: Reset (bool)
+        # [7]: RequestGhost (bool)
+        
+        # 1. Pack basic controls (8 bytes)
+        header = struct.pack('<fBBBB', 
+            float(steering),
+            1 if brake else 0,
+            1 if arms_up else 0,
+            1 if reset else 0,
+            1 if request_ghost else 0
+        )
+        
+        # 2. Append TargetPositions and Time as JSON
         input_data = {
-            "Steering": float(steering),
-            "Brake": bool(brake),
-            "ArmsUp": bool(arms_up),
-            "Reset": bool(reset),
-            "RequestGhost": bool(request_ghost),
-            "TargetPositions": self.last_target_positions
+            "p": [[round(c, 2) for c in pos] for pos in self.last_target_positions],
+            "t": round(time.time() - self.start_training_time, 1)
         }
-        msg = json.dumps(input_data).encode('utf-8')
+        targets_json = json.dumps(input_data)
+        msg = header + targets_json.encode('utf-8')
+        
         try: self.input_socket.sendto(msg, (self.host, self.input_port))
         except: pass
 

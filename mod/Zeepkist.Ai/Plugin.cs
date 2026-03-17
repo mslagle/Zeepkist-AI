@@ -2,6 +2,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -162,20 +163,52 @@ namespace Zeepkist.Ai
             }
         }
 
+        private static byte[] currentGhostBinary = null;
+        private static readonly object ghostLock = new object();
+
         private void SetupNetwork()
         {
             try
             {
                 telemetryClient = new UdpClient();
+                telemetryClient.Client.SendBufferSize = 65536;
                 telemetryEndPoint = new IPEndPoint(IPAddress.Parse("127.0.0.1"), TelemetryPort.Value);
 
                 inputServer = new UdpClient(InputPort.Value);
+                inputServer.Client.ReceiveBufferSize = 65536;
                 inputEndPoint = new IPEndPoint(IPAddress.Any, InputPort.Value);
                 inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null);
 
                 pointsTcpListener = new TcpListener(IPAddress.Parse("127.0.0.1"), PointsTcpPort.Value);
                 pointsTcpListener.Start();
                 Logger.LogInfo($"[AI_DEBUG] TCP Points Server started on port {PointsTcpPort.Value}");
+                
+                // Start persistent acceptance loop
+                Task.Run(async () => {
+                    while (true) {
+                        try {
+                            using (TcpClient client = await pointsTcpListener.AcceptTcpClientAsync())
+                            using (NetworkStream stream = client.GetStream())
+                            {
+                                byte[] dataToSend = null;
+                                lock (ghostLock) { dataToSend = currentGhostBinary; }
+
+                                if (dataToSend != null) {
+                                    byte[] sizeBytes = BitConverter.GetBytes(dataToSend.Length);
+                                    await stream.WriteAsync(sizeBytes, 0, 4);
+                                    await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
+                                    Logger.LogInfo($"[AI_DEBUG] Sent {dataToSend.Length} bytes to Python via TCP.");
+                                    ghostLoaded = true;
+                                } else {
+                                    Logger.LogWarning("[AI_DEBUG] Python connected but no ghost data is ready yet.");
+                                }
+                            }
+                        } catch (Exception ex) {
+                            Logger.LogError($"[AI_DEBUG] TCP Server Loop Error: {ex.Message}");
+                            await Task.Delay(1000);
+                        }
+                    }
+                });
             }
             catch (Exception ex)
             {
@@ -188,17 +221,28 @@ namespace Zeepkist.Ai
             try
             {
                 byte[] bytes = inputServer.EndReceive(res, ref inputEndPoint);
-                string json = Encoding.UTF8.GetString(bytes);
-                var input = JsonConvert.DeserializeObject<AiInput>(json);
-                if (input != null)
+                if (bytes.Length >= 8) // Min size for binary control
                 {
-                    CurrentInput = input;
-                    
-                    if (CurrentInput.TargetPositions != null)
+                    using (MemoryStream ms = new MemoryStream(bytes))
+                    using (BinaryReader reader = new BinaryWriter(ms).BaseStream is MemoryStream ? new BinaryReader(ms) : new BinaryReader(ms))
                     {
-                        lock (targetLock)
+                        // Simplified reader
+                        CurrentInput.Steering = BitConverter.ToSingle(bytes, 0);
+                        CurrentInput.Brake = bytes[4] != 0;
+                        CurrentInput.ArmsUp = bytes[5] != 0;
+                        CurrentInput.Reset = bytes[6] != 0;
+                        CurrentInput.RequestGhost = bytes[7] != 0;
+                        
+                        // Target Positions still use JSON as they are complex arrays
+                        // but we only send them if the packet is larger
+                        if (bytes.Length > 8)
                         {
-                            latestTargetPositions = CurrentInput.TargetPositions;
+                            string json = Encoding.UTF8.GetString(bytes, 8, bytes.Length - 8);
+                            var targets = JsonConvert.DeserializeObject<float[][]>(json);
+                            if (targets != null)
+                            {
+                                lock (targetLock) { latestTargetPositions = targets; }
+                            }
                         }
                     }
 
@@ -284,6 +328,24 @@ namespace Zeepkist.Ai
         }
     }
 
+        private void OnGUI()
+        {
+            if (EnableAi.Value && CurrentInput != null)
+            {
+                TimeSpan t = TimeSpan.FromSeconds(CurrentInput.TrainingTime);
+                string timeStr = string.Format("{0:D2}:{1:02}:{2:02}", t.Hours, t.Minutes, t.Seconds);
+                
+                GUIStyle style = new GUIStyle();
+                style.fontSize = 48;
+                style.normal.textColor = Color.white;
+                style.fontStyle = FontStyle.Bold;
+
+                // Outline for better visibility
+                GUI.Label(new Rect(22, 22, 600, 80), $"Total Training Time: {timeStr}", new GUIStyle(style) { normal = { textColor = Color.black } });
+                GUI.Label(new Rect(20, 20, 600, 80), $"Total Training Time: {timeStr}", style);
+            }
+        }
+
         private void FixedUpdate()
         {
             if (!EnableAi.Value) return;
@@ -335,49 +397,105 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
         {
             try
             {
-                object data;
                 if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null)
                 {
-                    float maxRay = 40f;
                     var transform = playerCar.transform;
-                    
-                    // 13-Ray Fan: -60 to +60 degrees (Step of 10)
                     float[] rayDistances = new float[13];
                     for (int i = 0; i < 13; i++)
                     {
                         float angle = -60f + (i * 10f);
                         Vector3 dir = Quaternion.Euler(0, angle, 0) * transform.forward;
-                        // Range scales from 100 (center) to 20 (sides)
                         float range = Mathf.Lerp(100f, 20f, Mathf.Abs(angle) / 60f);
                         rayDistances[i] = GetRaycast(dir, range, i);
                     }
 
-                    data = new
+                    // Binary Format:
+                    // [0-3]: Time (float)
+                    // [4-15]: Pos (3 floats)
+                    // [16-31]: Rot (4 floats)
+                    // [32-43]: Vel (3 floats)
+                    // [44-55]: AngVel (3 floats)
+                    // [56-59]: Speed (float)
+                    // [60]: IsSpawned (bool)
+                    // [61]: GhostLoaded (bool)
+                    // [62]: CheckpointReached (bool)
+                    // [63-114]: 13 Rays (13 floats)
+                    // [115]: IsSlipping (bool)
+                    // [116-119]: SurfaceFriction (float)
+                    // [120-...]: LevelHash (encoded)
+                    
+                    bool isSlipping = false;
+                    float friction = 1.0f;
+                    if (playerCar.wheels != null && playerCar.wheels.Count > 0)
                     {
-                        Time = Time.time,
-                        Position = new { x = transform.position.x, y = transform.position.y, z = transform.position.z },
-                        Rotation = new { x = transform.rotation.x, y = transform.rotation.y, z = transform.rotation.z, w = transform.rotation.w },
-                        Velocity = new { x = playerCar.rb.velocity.x, y = playerCar.rb.velocity.y, z = playerCar.rb.velocity.z },
-                        AngularVelocity = new { x = playerCar.rb.angularVelocity.x, y = playerCar.rb.angularVelocity.y, z = playerCar.rb.angularVelocity.z },
-                        Speed = playerCar.rb.velocity.magnitude,
-                        LocalGForce = new { x = playerCar.localGForce.x, y = playerCar.localGForce.y },
-                        LevelHash = currentLevelHash,
-                        IsSpawned = true,
-                        GhostLoaded = ghostLoaded,
-                        ResetReason = lastResetReason,
-                        CheckpointReached = checkpointReached,
-                        Rays = rayDistances
-                    };
+                        var firstSlippingWheel = playerCar.wheels.FirstOrDefault(x => x != null && x.IsGrounded() && x.IsSlipping());
+                        isSlipping = firstSlippingWheel != null;
+                        
+                        var firstGroundedWheel = playerCar.wheels.FirstOrDefault(x => x != null && x.IsGrounded());
+                        if (firstGroundedWheel != null && firstGroundedWheel.GetCurrentSurface() != null && firstGroundedWheel.GetCurrentSurface().physics != null)
+                        {
+                            friction = firstGroundedWheel.GetCurrentSurface().physics.frictionFront;
+                        }
+                    }
+
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                        using (BinaryWriter writer = new BinaryWriter(ms))
+                        {
+                            writer.Write(Time.time);
+                            writer.Write(transform.position.x);
+                            writer.Write(transform.position.y);
+                            writer.Write(transform.position.z);
+                            writer.Write(transform.rotation.x);
+                            writer.Write(transform.rotation.y);
+                            writer.Write(transform.rotation.z);
+                            writer.Write(transform.rotation.w);
+                            writer.Write(playerCar.rb.velocity.x);
+                            writer.Write(playerCar.rb.velocity.y);
+                            writer.Write(playerCar.rb.velocity.z);
+                            writer.Write(playerCar.rb.angularVelocity.x);
+                            writer.Write(playerCar.rb.angularVelocity.y);
+                            writer.Write(playerCar.rb.angularVelocity.z);
+                            writer.Write(playerCar.rb.velocity.magnitude);
+                            writer.Write(true); // IsSpawned
+                            writer.Write(ghostLoaded);
+                            writer.Write(checkpointReached);
+                            foreach (float r in rayDistances) writer.Write(r);
+                            writer.Write(isSlipping);
+                            writer.Write(friction);
+                            writer.Write(currentLevelHash);
+                            writer.Write(lastResetReason);
+                        }
+                        byte[] bytes = ms.ToArray();
+                        telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint);
+                    }
                     checkpointReached = false;
                 }
                 else
                 {
-                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash, GhostLoaded = ghostLoaded, ResetReason = lastResetReason, CheckpointReached = false };
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                        using (BinaryWriter writer = new BinaryWriter(ms))
+                        {
+                            writer.Write(Time.time);
+                            writer.Write(0f); writer.Write(0f); writer.Write(0f); // Pos
+                            writer.Write(0f); writer.Write(0f); writer.Write(0f); writer.Write(1f); // Rot
+                            writer.Write(0f); writer.Write(0f); writer.Write(0f); // Vel
+                            writer.Write(0f); writer.Write(0f); writer.Write(0f); // AngVel
+                            writer.Write(0f); // Speed
+                            writer.Write(false); // IsSpawned
+                            writer.Write(ghostLoaded);
+                            writer.Write(false); // CheckpointReached
+                            for (int i = 0; i < 13; i++) writer.Write(0f); // Rays
+                            writer.Write(false); // IsSlipping
+                            writer.Write(1.0f); // Friction
+                            writer.Write(currentLevelHash);
+                            writer.Write(lastResetReason);
+                        }
+                        byte[] bytes = ms.ToArray();
+                        telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint);
+                    }
                 }
-
-                string json = JsonConvert.SerializeObject(data);
-                byte[] bytes = Encoding.UTF8.GetBytes(json);
-                telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint);
             }
             catch { }
         }
@@ -594,5 +712,6 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
         public bool Reset;
         public bool RequestGhost;
         public float[][] TargetPositions;
+        public float TrainingTime;
     }
 }
