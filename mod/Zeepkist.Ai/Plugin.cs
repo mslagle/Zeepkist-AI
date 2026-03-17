@@ -45,11 +45,14 @@ namespace Zeepkist.Ai
         private static RaycastVisualizer rayVisualizer = null;
         private static TargetVisualizer targetVisualizer = null;
         private static string lastResetReason = "None";
+        private static bool checkpointReached = false;
 
         private static GtrClient.GtrClient gtrClient;
         private static List<Vector3> cachedPoints = null;
         private static string cachedHash = "";
         private static bool isSendingPoints = false;
+        private static float[][] latestTargetPositions = null;
+        private static readonly object targetLock = new object();
 
         private void Awake()
         {
@@ -68,20 +71,6 @@ namespace Zeepkist.Ai
             SetupNetwork();
 
             RacingApi.PlayerSpawned += () => {
-                playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
-                string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
-                lastResetReason = "None";
-                
-                if (newHash != currentLevelHash)
-                {
-                    Debug.Log($"[AI_DEBUG] Level change detected: {currentLevelHash} -> {newHash}. Resetting state.");
-                    currentLevelHash = newHash;
-                    ghostLoaded = false;
-                    cachedPoints = null;
-                    cachedHash = "";
-                    Task.Run(() => FetchAndProcessGhost(currentLevelHash));
-                }
-                
                 if (visualizer == null)
                 {
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
@@ -99,6 +88,20 @@ namespace Zeepkist.Ai
                     GameObject targetObj = new GameObject("AI_TargetVisualizer");
                     targetVisualizer = targetObj.AddComponent<TargetVisualizer>();
                 }
+
+                playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
+                string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
+                lastResetReason = "None";
+                
+                if (newHash != currentLevelHash)
+                {
+                    Logger.LogInfo($"[AI_DEBUG] Level change detected: {currentLevelHash} -> {newHash}. Resetting state.");
+                    currentLevelHash = newHash;
+                    ghostLoaded = false;
+                    cachedPoints = null;
+                    cachedHash = "";
+                    Task.Run(() => FetchAndProcessGhost(currentLevelHash));
+                }
             };
 
             RacingApi.Crashed += (reason) => { 
@@ -112,6 +115,10 @@ namespace Zeepkist.Ai
             RacingApi.WheelBroken += () => { 
                 playerCar = null; 
                 lastResetReason = "Wheel Broken";
+            };
+
+            RacingApi.PassedCheckpoint += (time) => {
+                checkpointReached = true;
             };
 
             Logger.LogInfo($"[AI_DEBUG] Plugin fully initialized!");
@@ -187,11 +194,12 @@ namespace Zeepkist.Ai
                 {
                     CurrentInput = input;
                     
-                    if (CurrentInput.TargetPositions != null && targetVisualizer != null)
+                    if (CurrentInput.TargetPositions != null)
                     {
-                        UnityMainThreadDispatcher.Instance().Enqueue(() => {
-                            targetVisualizer.UpdateTargets(CurrentInput.TargetPositions);
-                        });
+                        lock (targetLock)
+                        {
+                            latestTargetPositions = CurrentInput.TargetPositions;
+                        }
                     }
 
                     if (CurrentInput.RequestGhost && cachedPoints != null && cachedHash != "" && !isSendingPoints)
@@ -207,6 +215,23 @@ namespace Zeepkist.Ai
                 inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null);
             }
             catch { }
+        }
+
+        private void Update()
+        {
+            if (latestTargetPositions != null && targetVisualizer != null)
+            {
+                float[][] posToUpdate = null;
+                lock (targetLock)
+                {
+                    posToUpdate = latestTargetPositions;
+                    latestTargetPositions = null;
+                }
+                if (posToUpdate != null)
+                {
+                    targetVisualizer.UpdateTargets(posToUpdate);
+                }
+            }
         }
 
     public class TargetVisualizer : MonoBehaviour
@@ -316,11 +341,16 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
                     float maxRay = 40f;
                     var transform = playerCar.transform;
                     
-                    float r0 = GetRaycast(transform.forward, maxRay, 0);
-                    float r1 = GetRaycast(transform.forward + transform.right * 0.5f, maxRay, 1);
-                    float r2 = GetRaycast(transform.forward - transform.right * 0.5f, maxRay, 2);
-                    float r3 = GetRaycast(transform.right, 10f, 3);
-                    float r4 = GetRaycast(-transform.right, 10f, 4);
+                    // 13-Ray Fan: -60 to +60 degrees (Step of 10)
+                    float[] rayDistances = new float[13];
+                    for (int i = 0; i < 13; i++)
+                    {
+                        float angle = -60f + (i * 10f);
+                        Vector3 dir = Quaternion.Euler(0, angle, 0) * transform.forward;
+                        // Range scales from 100 (center) to 20 (sides)
+                        float range = Mathf.Lerp(100f, 20f, Mathf.Abs(angle) / 60f);
+                        rayDistances[i] = GetRaycast(dir, range, i);
+                    }
 
                     data = new
                     {
@@ -335,12 +365,14 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
                         IsSpawned = true,
                         GhostLoaded = ghostLoaded,
                         ResetReason = lastResetReason,
-                        Rays = new float[] { r0, r1, r2, r3, r4 }
+                        CheckpointReached = checkpointReached,
+                        Rays = rayDistances
                     };
+                    checkpointReached = false;
                 }
                 else
                 {
-                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash, GhostLoaded = ghostLoaded, ResetReason = lastResetReason };
+                    data = new { Time = Time.time, IsSpawned = false, LevelHash = currentLevelHash, GhostLoaded = ghostLoaded, ResetReason = lastResetReason, CheckpointReached = false };
                 }
 
                 string json = JsonConvert.SerializeObject(data);
@@ -364,7 +396,7 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
             if (points == null || points.Count == 0 || isSendingPoints) return;
 
             isSendingPoints = true;
-            Task.Run(() => {
+            Task.Run(async () => {
                 try {
                     // Downsample: Take every 10th point
                     List<float[]> downsampled = new List<float[]>();
@@ -374,25 +406,39 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
 
                     Logger.LogInfo($"[AI_DEBUG] Waiting for Python TCP connection to send {downsampled.Count} points...");
                     
-                    using (TcpClient client = pointsTcpListener.AcceptTcpClient())
-                    using (NetworkStream stream = client.GetStream())
+                    // Wait up to 5 seconds for a connection
+                    DateTime start = DateTime.Now;
+                    while (!pointsTcpListener.Pending() && (DateTime.Now - start).TotalSeconds < 5)
                     {
-                        var data = new { 
-                            LevelHash = levelHash, 
-                            FrameCount = downsampled.Count, 
-                            Points = downsampled 
-                        };
-                        string json = JsonConvert.SerializeObject(data);
-                        byte[] bytes = Encoding.UTF8.GetBytes(json);
-                        
-                        // Send size first (4 bytes)
-                        byte[] sizeBytes = BitConverter.GetBytes(bytes.Length);
-                        stream.Write(sizeBytes, 0, 4);
-                        
-                        // Send data
-                        stream.Write(bytes, 0, bytes.Length);
-                        Logger.LogInfo($"[AI_DEBUG] Successfully sent all points over TCP.");
-                        ghostLoaded = true;
+                        await Task.Delay(100);
+                    }
+
+                    if (pointsTcpListener.Pending())
+                    {
+                        using (TcpClient client = pointsTcpListener.AcceptTcpClient())
+                        using (NetworkStream stream = client.GetStream())
+                        {
+                            var data = new { 
+                                LevelHash = levelHash, 
+                                FrameCount = downsampled.Count, 
+                                Points = downsampled 
+                            };
+                            string json = JsonConvert.SerializeObject(data);
+                            byte[] bytes = Encoding.UTF8.GetBytes(json);
+                            
+                            // Send size first (4 bytes)
+                            byte[] sizeBytes = BitConverter.GetBytes(bytes.Length);
+                            stream.Write(sizeBytes, 0, 4);
+                            
+                            // Send data
+                            stream.Write(bytes, 0, bytes.Length);
+                            Logger.LogInfo($"[AI_DEBUG] Successfully sent all points over TCP.");
+                            ghostLoaded = true;
+                        }
+                    }
+                    else
+                    {
+                        Logger.LogWarning("[AI_DEBUG] TCP connection timed out waiting for Python.");
                     }
                 } catch (Exception ex) {
                     Logger.LogError($"[AI_DEBUG] TCP Send Error: {ex.Message}");
@@ -401,7 +447,7 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
                 }
             });
         }
-
+        
         [HarmonyPatch(typeof(New_ControlCar), "Update")]
         public static class New_ControlCar_Update_Patch
         {
@@ -486,6 +532,7 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
         public void UpdateLine(List<Vector3> points)
         {
             if (points == null) return;
+            Debug.Log($"[AI_DEBUG] Updating Ghost Line with {points.Count} points.");
             line.positionCount = points.Count;
             line.SetPositions(points.ToArray());
         }
@@ -494,7 +541,7 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
     public class RaycastVisualizer : MonoBehaviour
     {
         private LineRenderer[] lines;
-        private const int RayCount = 5;
+        private const int RayCount = 13;
 
         private void Awake()
         {
@@ -505,8 +552,8 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
                 lineObj.transform.SetParent(this.transform);
                 LineRenderer lr = lineObj.AddComponent<LineRenderer>();
                 lr.useWorldSpace = true;
-                lr.startWidth = 0.1f;
-                lr.endWidth = 0.1f;
+                lr.startWidth = 0.05f;
+                lr.endWidth = 0.05f;
                 lr.material = new Material(Shader.Find("Hidden/Internal-Colored"));
                 lr.material.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
                 lr.material.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);

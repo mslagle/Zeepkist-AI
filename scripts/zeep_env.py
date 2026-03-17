@@ -24,7 +24,7 @@ class ZeepkistEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation Space: 33 dimensions
+        # Observation Space: 41 dimensions
         # 0-13: Basic Telemetry (Pos, Rot, Vel, AngVel, Speed)
         # 14-16: Rel Nearest Ghost Point
         # 17-19: Rel Lookahead 1 (+20 frames)
@@ -32,11 +32,11 @@ class ZeepkistEnv(gym.Env):
         # 23-25: Rel Lookahead 3 (+100 frames)
         # 26: Progress (0.0 to 1.0)
         # 27: Ghost Loaded Flag (0 or 1)
-        # 28-32: Raycasts (5 distances)
+        # 28-40: Raycasts (13 distances)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(33,),
+            shape=(41,),
             dtype=np.float32
         )
 
@@ -228,52 +228,55 @@ class ZeepkistEnv(gym.Env):
             self.last_telemetry['Position']['z']
         ])
         
-        # Biased search around current progress
-        look_ahead_search = 2000
-        look_back_search = 500
-        start_idx = max(0, self.last_ghost_index - look_back_search)
-        end_idx = min(len(self.ghost_positions), self.last_ghost_index + look_ahead_search)
+        # Biased search: only look ahead from the current index.
+        # This prevents the AI from ever turning back.
+        look_ahead_search = 1000
+        start_idx = self.last_ghost_index
+        end_idx = min(len(self.ghost_positions), start_idx + look_ahead_search)
         
         subset = self.ghost_positions[start_idx:end_idx]
         
         if len(subset) == 0:
-            idx = self.last_ghost_index
+            nearest_idx = self.last_ghost_index
         else:
             diffs = subset - pos
             distances_sq = np.sum(diffs**2, axis=1)
             local_idx = np.argmin(distances_sq)
-            idx = local_idx + start_idx
             
-            # Fallback if window is lost
-            if np.sqrt(distances_sq[local_idx]) > 5.0:
+            # nearest_idx is where the car physically is on the path
+            nearest_idx = local_idx + start_idx
+            
+            # Fallback if window is lost (Dist > 10)
+            if np.sqrt(distances_sq[local_idx]) > 10.0:
                 full_diffs = self.ghost_positions - pos
                 full_dist_sq = np.sum(full_diffs**2, axis=1)
-                idx = np.argmin(full_dist_sq)
+                nearest_idx = np.argmin(full_dist_sq)
         
-        # Smooth progress
-        if idx < self.last_ghost_index - 200 and self.steps_in_episode > 10:
-            idx = self.last_ghost_index
-            
-        self.last_ghost_index = idx
-        nearest_pos = self.ghost_positions[idx]
-        relative_vec = nearest_pos - pos
+        # Current progress is the nearest point
+        self.last_ghost_index = nearest_idx
         
-        # Lookahead points (Downsampled by 10, so 2, 5, 10 = 20, 50, 100 original frames)
+        # TARGET point is always 1 step ahead of nearest to pull the car forward
+        target_idx = min(len(self.ghost_positions) - 1, nearest_idx + 1)
+        
+        target_pos = self.ghost_positions[target_idx]
+        relative_vec = target_pos - pos
+        
+        # Lookahead points relative to the advancing target
         lookaheads = [2, 5, 10]
         lookahead_vecs = []
-        target_positions = [nearest_pos.tolist()]
+        target_positions = [target_pos.tolist()]
         for offset in lookaheads:
-            l_idx = min(len(self.ghost_positions) - 1, idx + offset)
+            l_idx = min(len(self.ghost_positions) - 1, target_idx + offset)
             lookahead_vecs.append(self.ghost_positions[l_idx] - pos)
             target_positions.append(self.ghost_positions[l_idx].tolist())
         
-        progress = idx / len(self.ghost_positions) if len(self.ghost_positions) > 0 else 0.0
+        progress = nearest_idx / len(self.ghost_positions) if len(self.ghost_positions) > 0 else 0.0
         
         if self.steps_in_episode % 100 == 0:
             dist = np.linalg.norm(relative_vec)
-            print(f"Path Debug: Idx={idx}/{len(self.ghost_positions)}, Dist={dist:.2f}, Progress={progress:.1%}")
+            print(f"Path Debug: Nearest={nearest_idx}, Target={target_idx}, DistToTarget={dist:.2f}, Progress={progress:.1%}")
 
-        return relative_vec, np.array(lookahead_vecs), idx, progress, target_positions
+        return relative_vec, np.array(lookahead_vecs), nearest_idx, progress, target_positions
 
     def _rotate_vector_to_local(self, world_vec, quat):
         """Rotates a world-space vector into the car's local coordinate system."""
@@ -343,18 +346,19 @@ class ZeepkistEnv(gym.Env):
         return obs
 
     def _calculate_reward(self, obs, steering, brake_val):
-        # Index Map:
-        # 0-2: Local Velocity (X: Side, Y: Up, Z: Forward)
-        # 3-5: Angular Velocity
-        # 6: Speed
-        # 7-9: Local Relative Near Ghost
-        # 19-21: Local Path Direction (Unit vector)
+        # Index Map (41 Dims):
+        # 0-2: Local Velocity, 3-5: Angular Velocity, 6: Speed
+        # 7-9: Local Rel Near Ghost
+        # 10-18: Local Lookaheads (3x3)
+        # 19-21: Local Path Direction
+        # 22: Progress, 23: Ghost Loaded, 24-36: 13 Rays, 37-40: Quat
         
         reward = 0.0
         local_vel = obs[0:3]
         speed = obs[6]
         rel_near_local = obs[7:10]
         path_dir_local = obs[19:22]
+        rays = obs[24:37]
         
         # 1. Track-Aligned Velocity (The most important reward)
         # We reward speed that is going ALONG the path direction
@@ -387,14 +391,18 @@ class ZeepkistEnv(gym.Env):
             reward -= steering_change * 0.5 # Reduced from 2.0
         self.last_steering = steering
 
-        # 5. Collision Avoidance (Quadratic remains but slightly gentler)
-        rays = obs[24:29]
+        # 5. Collision Avoidance (13 Rays)
+        # Scale threshold based on speed to match the new 100-unit vision
+        proximity_threshold = min(30.0, 3.0 + (speed * 0.3))
         proximity_penalty = 0.0
-        weights = [1.0, 0.8, 0.8, 0.3, 0.3]
+        # Weights for 13 rays: more focus on the front
+        # Angles: -90, -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 90
+        weights = [0.2, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 1.0, 0.9, 0.7, 0.5, 0.3, 0.2]
+        
         for i, r_dist in enumerate(rays):
-            if r_dist < 5.0: # Detect closer obstacles
-                depth = (5.0 - r_dist) / 5.0
-                proximity_penalty += (depth ** 2) * 5.0 * weights[i]
+            if r_dist < proximity_threshold:
+                depth = (proximity_threshold - r_dist) / proximity_threshold
+                proximity_penalty += (depth ** 2) * 10.0 * weights[i]
         reward -= proximity_penalty
 
         # 6. Braking (Severe penalty for low speed braking remains)
@@ -429,16 +437,25 @@ class ZeepkistEnv(gym.Env):
         obs = self._get_obs()
         reward = self._calculate_reward(obs, steering, brake_val)
         
+        # Checkpoint Reward
+        if self.last_telemetry.get('CheckpointReached', False):
+            print(f"  [REWARD] Checkpoint Reached! +100.0")
+            reward += 100.0
+
         # New Indices: 6 is Speed, 15 is Relative Y (Drop)
         speed = obs[6]
         
         reason = self.last_telemetry.get('ResetReason', 'None')
 
         if not self.last_telemetry.get('IsSpawned', False):
-            print(f"Episode End: Not Spawned (Reason: {reason}) | Final Penalty: -50.0")
-            return obs, -50.0, True, False, {}
+            if reason == "Finished":
+                print(f"Episode End: FINISHED! | Final Bonus: +1000.0")
+                return obs, 1000.0, True, False, {}
+            else:
+                print(f"Episode End: Not Spawned (Reason: {reason}) | Final Penalty: -50.0")
+                return obs, -50.0, True, False, {}
 
-        if obs[8] > 10.0: # Index 8 is local Y of the relative ghost vector (ghost_y - pos_y)
+        if obs[8] > 20.0: # Index 8 is local Y of the relative ghost vector (ghost_y - pos_y)
             print(f"Episode End: Fell off map (Drop: {obs[8]:.1f}) | Final Penalty: -100.0")
             terminated = True; reward -= 100.0
         
