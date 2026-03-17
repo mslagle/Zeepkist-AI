@@ -364,6 +364,7 @@ namespace Zeepkist.Ai
         }
 
         private static bool ghostLoaded = false;
+        private static bool ghostReady = false;
 private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
 {
     if (playerCar == null) return maxDist;
@@ -459,6 +460,7 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
                             writer.Write(playerCar.rb.velocity.magnitude);
                             writer.Write(true); // IsSpawned
                             writer.Write(ghostLoaded);
+                            writer.Write(ghostReady);
                             writer.Write(checkpointReached);
                             foreach (float r in rayDistances) writer.Write(r);
                             writer.Write(isSlipping);
@@ -485,6 +487,7 @@ private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
                             writer.Write(0f); // Speed
                             writer.Write(false); // IsSpawned
                             writer.Write(ghostLoaded);
+                            writer.Write(ghostReady);
                             writer.Write(false); // CheckpointReached
                             for (int i = 0; i < 13; i++) writer.Write(0f); // Rays
                             writer.Write(false); // IsSlipping

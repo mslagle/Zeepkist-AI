@@ -154,6 +154,7 @@ class ZeepkistEnv(gym.Env):
             t['Speed'] = read_float()
             t['IsSpawned'] = read_bool()
             t['GhostLoaded'] = read_bool()
+            t['GhostReady'] = read_bool()
             t['CheckpointReached'] = read_bool()
             
             t['Rays'] = []
@@ -239,12 +240,17 @@ class ZeepkistEnv(gym.Env):
                 consecutive_spawned += 1
                 if consecutive_spawned >= 5: # Require 5 stable frames
                     if need_ghost:
-                        if self._receive_points_from_mod(level_hash):
-                            print("Ready! Player spawned and ghost data active.")
-                            break
+                        if t.get('GhostReady', False): # Wait for mod to cache data
+                            if self._receive_points_from_mod(level_hash):
+                                print("Ready! Player spawned and ghost data active.")
+                                break
+                            else:
+                                print("Ghost reception failed, retrying...")
+                                consecutive_spawned = 0
                         else:
-                            print("Ghost reception failed, retrying...")
-                            consecutive_spawned = 0
+                            # Still waiting for mod to parse/cache
+                            if self.steps_in_episode % 10 == 0:
+                                print("Waiting for mod to signal 'GhostReady'...")
                     else:
                         print("Ready! Ghost already cached.")
                         break
