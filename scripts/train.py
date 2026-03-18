@@ -4,9 +4,8 @@ import time
 import torch
 import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecEnv
-from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from zeep_env import ZeepkistEnv
 
 class CustomPPO(PPO):
@@ -44,8 +43,8 @@ def train():
     sys.stderr = sys.stdout
 
     # Constants for indefinite training
-    TOTAL_TIMESTEPS = 1_000_000_000 # 1 Billion (Practically infinite)
-    SAVE_FREQ = 50_000 # Save checkpoint every ~10-15 mins depending on FPS
+    TOTAL_TIMESTEPS = 1_000_000_000 # 1 Billion
+    SAVE_FREQ = 50_000 
 
     print("\n" + "="*50)
     print("Indefinite Training Session Started")
@@ -61,7 +60,6 @@ def train():
     if os.path.exists(stats_path):
         print("Attempting to load existing normalization stats...")
         try:
-            # We wrap this in a try-except to catch shape mismatches
             env = VecNormalize.load(stats_path, venv)
             print("Normalization stats loaded successfully.")
         except Exception as e:
@@ -81,19 +79,23 @@ def train():
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
+    # Standardized hyperparameters for stability
+    target_n_steps = 2048
+    target_batch_size = 128
+
     # 2. Define the model
     model = None
     if os.path.exists(model_path + ".zip"):
         print("Attempting to load existing model...")
         try:
-            # IMPORTANT: Use CustomPPO.load to keep our custom rollout logic
+            # IMPORTANT: Load as CustomPPO to keep our log message
             model = CustomPPO.load(model_path, env=env)
             
-            # Explicitly override n_steps and batch_size
-            model.n_steps = 16384
-            model.batch_size = 128
+            # Explicitly synchronize buffer settings
+            model.n_steps = target_n_steps
+            model.batch_size = target_batch_size
             
-            # CRITICAL: We must also resize the rollout buffer to match the new n_steps
+            # Rescale rollout buffer to prevent IndexError
             from stable_baselines3.common.buffers import RolloutBuffer
             model.rollout_buffer = RolloutBuffer(
                 model.n_steps,
@@ -104,14 +106,14 @@ def train():
                 gae_lambda=model.gae_lambda,
                 n_envs=model.n_envs,
             )
-            print(f"Model loaded successfully. Buffer resized to {model.n_steps}")
+            print(f"Model loaded successfully. Buffer size: {model.n_steps}")
             
             # Weight health check
             for param in model.policy.parameters():
                 if torch.isnan(param).any():
                     raise ValueError("Model weights contain NaN")
         except Exception as e:
-            print(f"Model load failed: {e}. This is likely due to a change in observation/action space.")
+            print(f"Model load failed: {e}. Starting fresh.")
             backup_name = f"{model_path}_failed_{int(time.time())}.zip"
             if os.path.exists(model_path + ".zip"):
                 os.rename(model_path + ".zip", backup_name)
@@ -125,8 +127,8 @@ def train():
             verbose=1, 
             tensorboard_log=log_dir,
             learning_rate=3e-4,
-            n_steps=16384, # Massive buffer (approx 4-5 mins of driving)
-            batch_size=128,
+            n_steps=target_n_steps,
+            batch_size=target_batch_size,
             n_epochs=10,
             gamma=0.99,
             gae_lambda=0.95,
