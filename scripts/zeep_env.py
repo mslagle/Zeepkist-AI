@@ -465,7 +465,7 @@ class ZeepkistEnv(gym.Env):
         
         # Quadratic change penalty
         steering_change = abs(steering - self.last_steering)
-        smoothness_penalty = (steering_change ** 2) * 5.0
+        smoothness_penalty = (steering_change ** 2) * 10.0
         
         reward -= (steering_penalty + smoothness_penalty)
         self.last_steering = steering
