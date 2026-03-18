@@ -65,8 +65,18 @@ class ZeepkistEnv(gym.Env):
         self.first_frame_after_reset = True
         self.last_steering = 0.0 # Track for smoothness
         self.last_target_positions = [[0,0,0]]*4
-        self.start_training_time = time.time()
         
+        # Cumulative Time Tracking
+        self.start_session_time = time.time()
+        self.time_file = "../zeepkist_total_time.txt"
+        self.accumulated_time = 0.0
+        if os.path.exists(self.time_file):
+            try:
+                with open(self.time_file, "r") as f:
+                    self.accumulated_time = float(f.read().strip())
+                print(f"Loaded cumulative training time: {self.accumulated_time:.1f}s")
+            except: pass
+
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
 
@@ -494,10 +504,11 @@ class ZeepkistEnv(gym.Env):
             1 if request_ghost else 0
         )
         
-        # 2. Append TargetPositions and Time as JSON
+        # 2. Append TargetPositions and Cumulative Time as JSON
+        total_time = self.accumulated_time + (time.time() - self.start_session_time)
         input_data = {
             "p": [[round(c, 2) for c in pos] for pos in self.last_target_positions],
-            "t": round(time.time() - self.start_training_time, 1)
+            "t": round(total_time, 1)
         }
         targets_json = json.dumps(input_data)
         msg = header + targets_json.encode('utf-8')
@@ -509,6 +520,14 @@ class ZeepkistEnv(gym.Env):
         self.steps_in_episode += 1
         steering, brake_val, arms_up_val = action[0], action[1], action[2]
         self._send_input(steering, brake_val > 0.5, arms_up_val > 0.5, reset=False)
+
+        # Periodically save total cumulative time (every 500 steps)
+        if self.steps_in_episode % 500 == 0:
+            total = self.accumulated_time + (time.time() - self.start_session_time)
+            try:
+                with open(self.time_file, "w") as f:
+                    f.write(str(total))
+            except: pass
 
         if not self._receive_telemetry():
             return self._get_obs(), -0.1, False, False, {}

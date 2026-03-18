@@ -43,9 +43,14 @@ class CustomPPO(PPO):
             if callback.on_step() is False:
                 return False
 
-            # SYNC ON RESET: If episode ended and we have enough data, trigger training now.
-            if dones[0] and n_steps >= 1024:
+            # SYNC ON RESET: If episode ended and we have enough data (min 2048), trigger training now.
+            if dones[0] and n_steps >= 2048:
                 print(f"Episode ended (Step {n_steps}). Starting brain update during reset...")
+                break
+            
+            # EMERGENCY BREAK: If we hit the absolute buffer limit, we must update.
+            if n_steps >= n_rollout_steps:
+                print(f"Buffer full ({n_steps} steps) mid-race. Updating now to prevent overflow.")
                 break
                 
         with torch.no_grad():
@@ -149,7 +154,7 @@ def train():
             verbose=1, 
             tensorboard_log=log_dir,
             learning_rate=3e-4,
-            n_steps=4096,
+            n_steps=16384, # Massive buffer (approx 4-5 mins of driving)
             batch_size=128,
             n_epochs=10,
             gamma=0.99,
