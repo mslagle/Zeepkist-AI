@@ -104,6 +104,10 @@ namespace Zeepkist.Ai
                     Task.Run(() => FetchAndProcessGhost(currentLevelHash));
                 } else {
                     lock (ghostLock) { ghostReady = true; }
+                    // Redraw the cached ghost line on spawn
+                    if (visualizer != null && ShowGhostPath.Value && cachedPoints != null) {
+                        visualizer.UpdateLine(cachedPoints);
+                    }
                 }
             };
 
