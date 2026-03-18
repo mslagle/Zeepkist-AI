@@ -139,8 +139,17 @@ class ZeepkistEnv(gym.Env):
 
             def read_string():
                 nonlocal ptr
-                length = data[ptr]
-                ptr += 1
+                # C# BinaryWriter strings use LEB128 for length prefix
+                length = 0
+                shift = 0
+                while True:
+                    byte = data[ptr]
+                    ptr += 1
+                    length |= (byte & 0x7F) << shift
+                    if (byte & 0x80) == 0:
+                        break
+                    shift += 7
+                
                 val = data[ptr:ptr+length].decode('utf-8')
                 ptr += length
                 return val
@@ -169,10 +178,9 @@ class ZeepkistEnv(gym.Env):
             
             self.last_telemetry = t
             
-            # Debug: Check for reset reasons
-            reason = t.get('ResetReason', 'None')
-            if reason != "None" and self.steps_in_episode % 500 == 0:
-                print(f"Mod Telemetry Reason: {reason}")
+            # Periodic Debug Log
+            if self.steps_in_episode % 1000 == 0:
+                print(f"[DEBUG] Telemetry: Spawned={t['IsSpawned']}, Ready={t['GhostReady']}, Loaded={t['GhostLoaded']}, Hash={t['LevelHash']}")
 
             new_hash = t.get('LevelHash')
             if (new_hash and new_hash != self.current_level_hash) or (self.current_level_hash is None):
@@ -189,7 +197,9 @@ class ZeepkistEnv(gym.Env):
                 self.points_socket.settimeout(original_timeout)
                 
             return True
-        except Exception:
+        except Exception as e:
+            if self.steps_in_episode % 100 == 0:
+                print(f"Telemetry Parse Error: {e}")
             return False
 
     def reset(self, seed=None, options=None):

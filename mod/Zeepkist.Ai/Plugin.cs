@@ -16,8 +16,6 @@ using ZeepSDK.Level;
 using Newtonsoft.Json;
 using System.Reflection;
 using Zeepkist.Ai.GtrClient;
-using TNRD.Zeepkist.GTR.Ghosting.Readers;
-using TNRD.Zeepkist.GTR.Ghosting.Ghosts;
 
 namespace Zeepkist.Ai
 {
@@ -55,6 +53,13 @@ namespace Zeepkist.Ai
         private static float[][] latestTargetPositions = null;
         private static readonly object targetLock = new object();
 
+        private static bool ghostLoaded = false;
+        private static bool ghostReady = false;
+        private static byte[] currentGhostBinary = null;
+        private static readonly object ghostLock = new object();
+        private static int inputPacketCount = 0;
+        private static DateTime lastInputTime = DateTime.MinValue;
+
         private void Awake()
         {
             Logger.LogInfo("[AI_DEBUG] === Plugin.Awake() STARTING ===");
@@ -72,20 +77,15 @@ namespace Zeepkist.Ai
             SetupNetwork();
 
             RacingApi.PlayerSpawned += () => {
-                if (visualizer == null)
-                {
+                if (visualizer == null) {
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
                     visualizer = vizObj.AddComponent<GhostVisualizer>();
                 }
-
-                if (rayVisualizer == null)
-                {
+                if (rayVisualizer == null) {
                     GameObject rayObj = new GameObject("AI_RayVisualizer");
                     rayVisualizer = rayObj.AddComponent<RaycastVisualizer>();
                 }
-
-                if (targetVisualizer == null)
-                {
+                if (targetVisualizer == null) {
                     GameObject targetObj = new GameObject("AI_TargetVisualizer");
                     targetVisualizer = targetObj.AddComponent<TargetVisualizer>();
                 }
@@ -94,33 +94,23 @@ namespace Zeepkist.Ai
                 string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
                 lastResetReason = "None";
                 
-                if (newHash != currentLevelHash)
-                {
-                    Logger.LogInfo($"[AI_DEBUG] Level change detected: {currentLevelHash} -> {newHash}. Resetting state.");
+                if (newHash != currentLevelHash || cachedPoints == null) {
+                    Logger.LogInfo($"[AI_DEBUG] Level setup: Hash={newHash}, CacheReady={cachedPoints != null}. Fetching ghost.");
                     currentLevelHash = newHash;
                     ghostLoaded = false;
+                    lock (ghostLock) { ghostReady = false; currentGhostBinary = null; }
                     cachedPoints = null;
                     cachedHash = "";
                     Task.Run(() => FetchAndProcessGhost(currentLevelHash));
+                } else {
+                    lock (ghostLock) { ghostReady = true; }
                 }
             };
 
-            RacingApi.Crashed += (reason) => { 
-                playerCar = null; 
-                lastResetReason = "Crashed: " + reason;
-            };
-            RacingApi.CrossedFinishLine += (time) => { 
-                playerCar = null; 
-                lastResetReason = "Finished";
-            };
-            RacingApi.WheelBroken += () => { 
-                playerCar = null; 
-                lastResetReason = "Wheel Broken";
-            };
-
-            RacingApi.PassedCheckpoint += (time) => {
-                checkpointReached = true;
-            };
+            RacingApi.Crashed += (reason) => { playerCar = null; lastResetReason = "Crashed: " + reason; };
+            RacingApi.CrossedFinishLine += (time) => { playerCar = null; lastResetReason = "Finished"; };
+            RacingApi.WheelBroken += () => { playerCar = null; lastResetReason = "Wheel Broken"; };
+            RacingApi.PassedCheckpoint += (time) => { checkpointReached = true; };
 
             Logger.LogInfo($"[AI_DEBUG] Plugin fully initialized!");
         }
@@ -128,48 +118,34 @@ namespace Zeepkist.Ai
         private async Task FetchAndProcessGhost(string hash)
         {
             if (hash == "Unknown") return;
-
-            try
-            {
-                Logger.LogInfo($"[AI_DEBUG] Fetching and parsing best ghost for {hash}...");
+            try {
+                Logger.LogInfo($"[AI_DEBUG] Fetching best ghost for {hash}...");
                 string url = await gtrClient.GetBestGhostUrl(hash);
-                if (string.IsNullOrEmpty(url))
-                {
-                    Logger.LogError($"[AI_DEBUG] No ghost found for {hash}");
+                if (string.IsNullOrEmpty(url)) {
+                    Logger.LogError($"[AI_DEBUG] No ghost URL found for {hash}. AI tracking will be disabled.");
                     return;
                 }
-
+                Logger.LogInfo($"[AI_DEBUG] Downloading/Parsing ghost: {url}");
                 List<Vector3> points = await gtrClient.DownloadAndParseGhost(url);
-                if (points == null) return;
+                if (points == null) { Logger.LogError("[AI_DEBUG] Ghost parsing failed (returned null)."); return; }
 
                 cachedPoints = points;
                 cachedHash = hash;
+                Logger.LogInfo($"[AI_DEBUG] Successfully processed {points.Count} points. Updating visualizer.");
 
-                Logger.LogInfo($"[AI_DEBUG] Received {points.Count} points from GtrClient.");
-
-                // Update visualizer on main thread
-                if (visualizer != null && ShowGhostPath.Value)
-                {
-                    UnityMainThreadDispatcher.Instance().Enqueue(() => {
-                        visualizer.UpdateLine(points);
-                    });
+                if (visualizer != null && ShowGhostPath.Value) {
+                    UnityMainThreadDispatcher.Instance().Enqueue(() => { visualizer.UpdateLine(points); });
                 }
-
-                SendPointsToPython(points, hash);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError($"[AI_DEBUG] Error in FetchAndProcessGhost: {ex.Message}");
+                PrepareGhostBinary(points, hash);
+                Logger.LogInfo("[AI_DEBUG] ghostReady is now TRUE.");
+            } catch (Exception ex) {
+                Logger.LogError($"[AI_DEBUG] Critical error in FetchAndProcessGhost: {ex.Message}");
             }
         }
 
-        private static byte[] currentGhostBinary = null;
-        private static readonly object ghostLock = new object();
-
         private void SetupNetwork()
         {
-            try
-            {
+            try {
                 telemetryClient = new UdpClient();
                 telemetryClient.Client.SendBufferSize = 65536;
                 telemetryEndPoint = new IPEndPoint(IPAddress.Parse("127.0.0.1"), TelemetryPort.Value);
@@ -179,29 +155,24 @@ namespace Zeepkist.Ai
                 inputEndPoint = new IPEndPoint(IPAddress.Any, InputPort.Value);
                 inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null);
 
-                pointsTcpListener = new TcpListener(IPAddress.Parse("127.0.0.1"), PointsTcpPort.Value);
+                pointsTcpListener = new TcpListener(IPAddress.Any, PointsTcpPort.Value);
                 pointsTcpListener.Start();
                 Logger.LogInfo($"[AI_DEBUG] TCP Points Server started on port {PointsTcpPort.Value}");
                 
-                // Start persistent acceptance loop
                 Task.Run(async () => {
                     while (true) {
                         try {
                             using (TcpClient client = await pointsTcpListener.AcceptTcpClientAsync())
-                            using (NetworkStream stream = client.GetStream())
-                            {
+                            using (NetworkStream stream = client.GetStream()) {
                                 byte[] dataToSend = null;
                                 lock (ghostLock) { dataToSend = currentGhostBinary; }
-
                                 if (dataToSend != null) {
                                     byte[] sizeBytes = BitConverter.GetBytes(dataToSend.Length);
                                     await stream.WriteAsync(sizeBytes, 0, 4);
                                     await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
                                     Logger.LogInfo($"[AI_DEBUG] Sent {dataToSend.Length} bytes to Python via TCP.");
                                     ghostLoaded = true;
-                                } else {
-                                    Logger.LogWarning("[AI_DEBUG] Python connected but no ghost data is ready yet.");
-                                }
+                                } else { Logger.LogWarning("[AI_DEBUG] Python connected but no ghost data is ready yet."); }
                             }
                         } catch (Exception ex) {
                             Logger.LogError($"[AI_DEBUG] TCP Server Loop Error: {ex.Message}");
@@ -209,139 +180,68 @@ namespace Zeepkist.Ai
                         }
                     }
                 });
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError($"AI Network Setup Error: {ex.Message}");
-            }
+            } catch (Exception ex) { Logger.LogError($"AI Network Setup Error: {ex.Message}"); }
         }
 
         private void OnReceiveInput(IAsyncResult res)
         {
-            try
-            {
+            try {
                 byte[] bytes = inputServer.EndReceive(res, ref inputEndPoint);
-                if (bytes.Length >= 8) // Min size for binary control
-                {
+                if (bytes.Length >= 8) {
+                    lastInputTime = DateTime.Now;
                     using (MemoryStream ms = new MemoryStream(bytes))
-                    using (BinaryReader reader = new BinaryWriter(ms).BaseStream is MemoryStream ? new BinaryReader(ms) : new BinaryReader(ms))
-                    {
-                        // Simplified reader
-                        CurrentInput.Steering = BitConverter.ToSingle(bytes, 0);
-                        CurrentInput.Brake = bytes[4] != 0;
-                        CurrentInput.ArmsUp = bytes[5] != 0;
-                        CurrentInput.Reset = bytes[6] != 0;
-                        CurrentInput.RequestGhost = bytes[7] != 0;
+                    using (BinaryReader reader = new BinaryReader(ms)) {
+                        CurrentInput.Steering = reader.ReadSingle();
+                        CurrentInput.Brake = reader.ReadBoolean();
+                        CurrentInput.ArmsUp = reader.ReadBoolean();
+                        CurrentInput.Reset = reader.ReadBoolean();
+                        CurrentInput.RequestGhost = reader.ReadBoolean();
                         
-                        // Target Positions still use JSON as they are complex arrays
-                        // but we only send them if the packet is larger
-                        if (bytes.Length > 8)
-                        {
+                        inputPacketCount++;
+                        if (inputPacketCount % 500 == 0) {
+                            Logger.LogInfo($"[AI_DEBUG] Recv Input: Steer={CurrentInput.Steering:F2}, Brake={CurrentInput.Brake}");
+                        }
+
+                        if (bytes.Length > 8) {
                             string json = Encoding.UTF8.GetString(bytes, 8, bytes.Length - 8);
-                            var targets = JsonConvert.DeserializeObject<float[][]>(json);
-                            if (targets != null)
-                            {
-                                lock (targetLock) { latestTargetPositions = targets; }
+                            var data = JsonConvert.DeserializeObject<JsonInputData>(json);
+                            if (data != null) {
+                                lock (targetLock) { latestTargetPositions = data.p; }
+                                CurrentInput.TrainingTime = data.t;
                             }
                         }
                     }
-
-                    if (CurrentInput.RequestGhost && cachedPoints != null && cachedHash != "" && !isSendingPoints)
-                    {
+                    if (CurrentInput.RequestGhost && cachedPoints != null && cachedHash != "" && !isSendingPoints) {
                         SendPointsToPython(cachedPoints, cachedHash);
                     }
                 }
-            }
-            catch { }
-
-            try
-            {
-                inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null);
-            }
-            catch { }
+            } catch { }
+            try { inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null); } catch { }
         }
 
         private void Update()
         {
-            if (latestTargetPositions != null && targetVisualizer != null)
-            {
+            if (Input.GetKeyDown(KeyCode.F9)) {
+                EnableAi.Value = !EnableAi.Value;
+                Logger.LogInfo($"[AI_DEBUG] AI CONTROL: {(EnableAi.Value ? "ENABLED" : "DISABLED")}");
+            }
+
+            if (latestTargetPositions != null && targetVisualizer != null) {
                 float[][] posToUpdate = null;
-                lock (targetLock)
-                {
-                    posToUpdate = latestTargetPositions;
-                    latestTargetPositions = null;
-                }
-                if (posToUpdate != null)
-                {
-                    targetVisualizer.UpdateTargets(posToUpdate);
-                }
+                lock (targetLock) { posToUpdate = latestTargetPositions; latestTargetPositions = null; }
+                if (posToUpdate != null) targetVisualizer.UpdateTargets(posToUpdate);
             }
         }
-
-    public class TargetVisualizer : MonoBehaviour
-    {
-        private GameObject[] markers;
-        private Color[] colors = new Color[] { Color.yellow, Color.cyan, Color.white, Color.white };
-
-        private void Awake()
-        {
-            markers = new GameObject[4]; // 1 Nearest + 3 Lookaheads
-            for (int i = 0; i < 4; i++)
-            {
-                markers[i] = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                markers[i].name = $"TargetMarker_{i}";
-                markers[i].transform.SetParent(this.transform);
-                markers[i].transform.localScale = Vector3.one * 1.5f;
-                
-                // Remove collider so it doesn't hit raycasts
-                Destroy(markers[i].GetComponent<SphereCollider>());
-                
-                Renderer r = markers[i].GetComponent<Renderer>();
-                r.material = new Material(Shader.Find("Hidden/Internal-Colored"));
-                r.material.color = colors[i % colors.Length];
-            }
-        }
-
-        public void UpdateTargets(float[][] positions)
-        {
-            if (positions == null) return;
-            for (int i = 0; i < markers.Length; i++)
-            {
-                if (i < positions.Length)
-                {
-                    markers[i].SetActive(true);
-                    markers[i].transform.position = new Vector3(positions[i][0], positions[i][1], positions[i][2]);
-                }
-                else
-                {
-                    markers[i].SetActive(false);
-                }
-            }
-        }
-
-        private void Update()
-        {
-            if (Plugin.playerCar == null)
-            {
-                foreach (var m in markers) if (m != null) m.SetActive(false);
-            }
-        }
-    }
 
         private void OnGUI()
         {
-            if (EnableAi.Value && CurrentInput != null)
-            {
+            if (EnableAi.Value && CurrentInput != null) {
                 TimeSpan t = TimeSpan.FromSeconds(CurrentInput.TrainingTime);
-                string timeStr = string.Format("{0:D2}:{1:02}:{2:02}", t.Hours, t.Minutes, t.Seconds);
-                
-                GUIStyle style = new GUIStyle();
-                style.fontSize = 48;
+                string timeStr = string.Format("{0:D2}:{1:D2}:{2:D2}", (int)t.TotalHours, t.Minutes, t.Seconds);
+                GUIStyle style = new GUIStyle { fontSize = 48, fontStyle = FontStyle.Bold };
+                style.normal.textColor = Color.black;
+                GUI.Label(new Rect(22, 22, 600, 80), $"Total Training Time: {timeStr}", style);
                 style.normal.textColor = Color.white;
-                style.fontStyle = FontStyle.Bold;
-
-                // Outline for better visibility
-                GUI.Label(new Rect(22, 22, 600, 80), $"Total Training Time: {timeStr}", new GUIStyle(style) { normal = { textColor = Color.black } });
                 GUI.Label(new Rect(20, 20, 600, 80), $"Total Training Time: {timeStr}", style);
             }
         }
@@ -350,371 +250,190 @@ namespace Zeepkist.Ai
         {
             if (!EnableAi.Value) return;
 
-            if (CurrentInput != null && CurrentInput.Reset)
-            {
-                if (PlayerManager.Instance != null && PlayerManager.Instance.currentMaster != null)
-                {
+            // Heartbeat: If Python pauses (training), hold last steering but don't reset.
+            bool isPaused = (DateTime.Now - lastInputTime).TotalMilliseconds > 500;
+
+            if (CurrentInput != null && CurrentInput.Reset && !isPaused) {
+                if (PlayerManager.Instance?.currentMaster != null) {
                     PlayerManager.Instance.currentMaster.RestartLevel();
-                    CurrentInput.Reset = false; 
-                    playerCar = null;
+                    CurrentInput.Reset = false; playerCar = null;
                 }
             }
-
             SendTelemetry();
         }
 
-        private static bool ghostLoaded = false;
-        private static bool ghostReady = false;
-private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
-{
-    if (playerCar == null) return maxDist;
-
-    Vector3 origin = playerCar.transform.position + Vector3.up * 0.5f;
-    RaycastHit hit;
-    float dist = maxDist;
-    bool isObstacle = false;
-
-    if (Physics.Raycast(origin, direction, out hit, maxDist))
-    {
-        // Filter: Only count it as an obstacle if the surface is NOT flat ground.
-        // A wall has a horizontal normal (low Y), ground has a vertical normal (high Y).
-        if (Mathf.Abs(hit.normal.y) < 0.8f) 
-        {
-            dist = hit.distance;
-            isObstacle = true;
-        }
-    }
-
-    if (rayVisualizer != null && index >= 0)
-    {
-        rayVisualizer.UpdateRay(index, origin, origin + direction * dist, isObstacle);
-    }
-
-    return dist;
-}
-
-
         private void SendTelemetry()
         {
-            try
-            {
-                if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null)
-                {
-                    var transform = playerCar.transform;
-                    float[] rayDistances = new float[13];
-                    for (int i = 0; i < 13; i++)
-                    {
-                        float angle = -60f + (i * 10f);
-                        Vector3 dir = Quaternion.Euler(0, angle, 0) * transform.forward;
-                        float range = Mathf.Lerp(100f, 20f, Mathf.Abs(angle) / 60f);
-                        rayDistances[i] = GetRaycast(dir, range, i);
-                    }
+            try {
+                using (MemoryStream ms = new MemoryStream())
+                using (BinaryWriter writer = new BinaryWriter(ms)) {
+                    if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null) {
+                        var transform = playerCar.transform;
+                        float[] rayDistances = new float[13];
+                        for (int i = 0; i < 13; i++) {
+                            float angle = -60f + (i * 10f);
+                            Vector3 dir = Quaternion.Euler(0, angle, 0) * transform.forward;
+                            float range = Mathf.Lerp(100f, 20f, Mathf.Abs(angle) / 60f);
+                            rayDistances[i] = GetRaycast(dir, range, i);
+                        }
 
-                    // Binary Format:
-                    // [0-3]: Time (float)
-                    // [4-15]: Pos (3 floats)
-                    // [16-31]: Rot (4 floats)
-                    // [32-43]: Vel (3 floats)
-                    // [44-55]: AngVel (3 floats)
-                    // [56-59]: Speed (float)
-                    // [60]: IsSpawned (bool)
-                    // [61]: GhostLoaded (bool)
-                    // [62]: CheckpointReached (bool)
-                    // [63-114]: 13 Rays (13 floats)
-                    // [115]: IsSlipping (bool)
-                    // [116-119]: SurfaceFriction (float)
-                    // [120-...]: LevelHash (encoded)
-                    
-                    bool isSlipping = false;
-                    float friction = 1.0f;
-                    if (playerCar.wheels != null && playerCar.wheels.Count > 0)
-                    {
-                        var firstSlippingWheel = playerCar.wheels.FirstOrDefault(x => x != null && x.IsGrounded() && x.IsSlipping());
-                        isSlipping = firstSlippingWheel != null;
-                        
-                        var firstGroundedWheel = playerCar.wheels.FirstOrDefault(x => x != null && x.IsGrounded());
-                        if (firstGroundedWheel != null && firstGroundedWheel.GetCurrentSurface() != null && firstGroundedWheel.GetCurrentSurface().physics != null)
-                        {
-                            friction = firstGroundedWheel.GetCurrentSurface().physics.frictionFront;
+                        bool isSlipping = false;
+                        float friction = 1.0f;
+                        if (playerCar.wheels != null) {
+                            isSlipping = playerCar.wheels.Any(x => x != null && x.IsGrounded() && x.IsSlipping());
+                            var grounded = playerCar.wheels.FirstOrDefault(x => x != null && x.IsGrounded());
+                            if (grounded?.GetCurrentSurface()?.physics != null)
+                                friction = grounded.GetCurrentSurface().physics.frictionFront;
                         }
-                    }
 
-                    using (MemoryStream ms = new MemoryStream())
-                    {
-                        using (BinaryWriter writer = new BinaryWriter(ms))
-                        {
-                            writer.Write(Time.time);
-                            writer.Write(transform.position.x);
-                            writer.Write(transform.position.y);
-                            writer.Write(transform.position.z);
-                            writer.Write(transform.rotation.x);
-                            writer.Write(transform.rotation.y);
-                            writer.Write(transform.rotation.z);
-                            writer.Write(transform.rotation.w);
-                            writer.Write(playerCar.rb.velocity.x);
-                            writer.Write(playerCar.rb.velocity.y);
-                            writer.Write(playerCar.rb.velocity.z);
-                            writer.Write(playerCar.rb.angularVelocity.x);
-                            writer.Write(playerCar.rb.angularVelocity.y);
-                            writer.Write(playerCar.rb.angularVelocity.z);
-                            writer.Write(playerCar.rb.velocity.magnitude);
-                            writer.Write(true); // IsSpawned
-                            writer.Write(ghostLoaded);
-                            writer.Write(ghostReady);
-                            writer.Write(checkpointReached);
-                            foreach (float r in rayDistances) writer.Write(r);
-                            writer.Write(isSlipping);
-                            writer.Write(friction);
-                            writer.Write(currentLevelHash);
-                            writer.Write(lastResetReason);
-                        }
-                        byte[] bytes = ms.ToArray();
-                        telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint);
+                        writer.Write(Time.time);
+                        writer.Write(transform.position.x); writer.Write(transform.position.y); writer.Write(transform.position.z);
+                        writer.Write(transform.rotation.x); writer.Write(transform.rotation.y); writer.Write(transform.rotation.z); writer.Write(transform.rotation.w);
+                        writer.Write(playerCar.rb.velocity.x); writer.Write(playerCar.rb.velocity.y); writer.Write(playerCar.rb.velocity.z);
+                        writer.Write(playerCar.rb.angularVelocity.x); writer.Write(playerCar.rb.angularVelocity.y); writer.Write(playerCar.rb.angularVelocity.z);
+                        writer.Write(playerCar.rb.velocity.magnitude);
+                        writer.Write(true); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(checkpointReached);
+                        foreach (float r in rayDistances) writer.Write(r);
+                        writer.Write(isSlipping); writer.Write(friction);
+                        writer.Write(currentLevelHash); writer.Write(lastResetReason);
+                        checkpointReached = false;
+                    } else {
+                        writer.Write(Time.time);
+                        writer.Write(0f); writer.Write(0f); writer.Write(0f);
+                        writer.Write(0f); writer.Write(0f); writer.Write(0f); writer.Write(1f);
+                        writer.Write(0f); writer.Write(0f); writer.Write(0f);
+                        writer.Write(0f); writer.Write(0f); writer.Write(0f);
+                        writer.Write(0f);
+                        writer.Write(false); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(false);
+                        for (int i = 0; i < 13; i++) writer.Write(0f);
+                        writer.Write(false); writer.Write(1.0f);
+                        writer.Write(currentLevelHash); writer.Write(lastResetReason);
                     }
-                    checkpointReached = false;
+                    byte[] bytes = ms.ToArray();
+                    telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint);
                 }
-                else
-                {
-                    using (MemoryStream ms = new MemoryStream())
-                    {
-                        using (BinaryWriter writer = new BinaryWriter(ms))
-                        {
-                            writer.Write(Time.time);
-                            writer.Write(0f); writer.Write(0f); writer.Write(0f); // Pos
-                            writer.Write(0f); writer.Write(0f); writer.Write(0f); writer.Write(1f); // Rot
-                            writer.Write(0f); writer.Write(0f); writer.Write(0f); // Vel
-                            writer.Write(0f); writer.Write(0f); writer.Write(0f); // AngVel
-                            writer.Write(0f); // Speed
-                            writer.Write(false); // IsSpawned
-                            writer.Write(ghostLoaded);
-                            writer.Write(ghostReady);
-                            writer.Write(false); // CheckpointReached
-                            for (int i = 0; i < 13; i++) writer.Write(0f); // Rays
-                            writer.Write(false); // IsSlipping
-                            writer.Write(1.0f); // Friction
-                            writer.Write(currentLevelHash);
-                            writer.Write(lastResetReason);
-                        }
-                        byte[] bytes = ms.ToArray();
-                        telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint);
-                    }
-                }
+            } catch { }
+        }
+
+        private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
+        {
+            if (playerCar == null) return maxDist;
+            Vector3 origin = playerCar.transform.position + Vector3.up * 0.5f;
+            RaycastHit hit;
+            float dist = maxDist;
+            bool isObstacle = false;
+            if (Physics.Raycast(origin, direction, out hit, maxDist)) {
+                if (Mathf.Abs(hit.normal.y) < 0.8f) { dist = hit.distance; isObstacle = true; }
             }
-            catch { }
+            if (rayVisualizer != null && index >= 0) rayVisualizer.UpdateRay(index, origin, origin + direction * dist, isObstacle);
+            return dist;
         }
 
-        public void OnDestroy()
+        public void PrepareGhostBinary(List<Vector3> points, string levelHash)
         {
-            harmony?.UnpatchSelf();
-            inputServer?.Close();
-            telemetryClient?.Close();
-            pointsTcpListener?.Stop();
-            if (visualizer != null) Destroy(visualizer.gameObject);
+            List<float[]> downsampled = new List<float[]>();
+            for (int i = 0; i < points.Count; i += 10)
+                downsampled.Add(new float[] { points[i].x, points[i].y, points[i].z });
+
+            var data = new { LevelHash = levelHash, FrameCount = downsampled.Count, Points = downsampled };
+            byte[] bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(data));
+            lock (ghostLock) { currentGhostBinary = bytes; ghostReady = true; }
         }
 
-        public void SendPointsToPython(List<Vector3> points, string levelHash)
-        {
-            if (points == null || points.Count == 0 || isSendingPoints) return;
+        public void OnDestroy() { harmony?.UnpatchSelf(); inputServer?.Close(); telemetryClient?.Close(); pointsTcpListener?.Stop(); }
 
-            isSendingPoints = true;
-            Task.Run(async () => {
-                try {
-                    // Downsample: Take every 10th point
-                    List<float[]> downsampled = new List<float[]>();
-                    for (int i = 0; i < points.Count; i += 10) {
-                        downsampled.Add(new float[] { points[i].x, points[i].y, points[i].z });
-                    }
+        public void SendPointsToPython(List<Vector3> points, string levelHash) { PrepareGhostBinary(points, levelHash); }
 
-                    Logger.LogInfo($"[AI_DEBUG] Waiting for Python TCP connection to send {downsampled.Count} points...");
-                    
-                    // Wait up to 5 seconds for a connection
-                    DateTime start = DateTime.Now;
-                    while (!pointsTcpListener.Pending() && (DateTime.Now - start).TotalSeconds < 5)
-                    {
-                        await Task.Delay(100);
-                    }
-
-                    if (pointsTcpListener.Pending())
-                    {
-                        using (TcpClient client = pointsTcpListener.AcceptTcpClient())
-                        using (NetworkStream stream = client.GetStream())
-                        {
-                            var data = new { 
-                                LevelHash = levelHash, 
-                                FrameCount = downsampled.Count, 
-                                Points = downsampled 
-                            };
-                            string json = JsonConvert.SerializeObject(data);
-                            byte[] bytes = Encoding.UTF8.GetBytes(json);
-                            
-                            // Send size first (4 bytes)
-                            byte[] sizeBytes = BitConverter.GetBytes(bytes.Length);
-                            stream.Write(sizeBytes, 0, 4);
-                            
-                            // Send data
-                            stream.Write(bytes, 0, bytes.Length);
-                            Logger.LogInfo($"[AI_DEBUG] Successfully sent all points over TCP.");
-                            ghostLoaded = true;
-                        }
-                    }
-                    else
-                    {
-                        Logger.LogWarning("[AI_DEBUG] TCP connection timed out waiting for Python.");
-                    }
-                } catch (Exception ex) {
-                    Logger.LogError($"[AI_DEBUG] TCP Send Error: {ex.Message}");
-                } finally {
-                    isSendingPoints = false;
-                }
-            });
-        }
-        
         [HarmonyPatch(typeof(New_ControlCar), "Update")]
-        public static class New_ControlCar_Update_Patch
-        {
-            public static void Postfix(New_ControlCar __instance)
-            {
-                if (EnableAi.Value && CurrentInput != null && playerCar != null && __instance == playerCar)
-                {
+        public static class New_ControlCar_Update_Patch {
+            public static void Postfix(New_ControlCar __instance) {
+                if (EnableAi.Value && CurrentInput != null && playerCar != null && __instance == playerCar) {
                     if (__instance.SteerAction2 != null) __instance.SteerAction2.axis = CurrentInput.Steering;
-                    if (__instance.BrakeAction2 != null)
-                    {
-                        __instance.BrakeAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f;
-                        __instance.BrakeAction2.buttonHeld = CurrentInput.Brake;
-                    }
-                    if (__instance.PitchBackwardAction2 != null)
-                    {
-                        __instance.PitchBackwardAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f;
-                        __instance.PitchBackwardAction2.buttonHeld = CurrentInput.Brake;
-                    }
-                    if (__instance.ArmsUpAction2 != null)
-                    {
-                        __instance.ArmsUpAction2.axis = CurrentInput.ArmsUp ? 1.0f : 0.0f;
-                        __instance.ArmsUpAction2.buttonHeld = CurrentInput.ArmsUp;
-                    }
+                    if (__instance.BrakeAction2 != null) { __instance.BrakeAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f; __instance.BrakeAction2.buttonHeld = CurrentInput.Brake; }
+                    if (__instance.PitchBackwardAction2 != null) { __instance.PitchBackwardAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f; __instance.PitchBackwardAction2.buttonHeld = CurrentInput.Brake; }
+                    if (__instance.ArmsUpAction2 != null) { __instance.ArmsUpAction2.axis = CurrentInput.ArmsUp ? 1.0f : 0.0f; __instance.ArmsUpAction2.buttonHeld = CurrentInput.ArmsUp; }
                 }
             }
         }
     }
 
-    public class UnityMainThreadDispatcher : MonoBehaviour
-    {
+    public class JsonInputData { public float[][] p; public float t; }
+
+    public class UnityMainThreadDispatcher : MonoBehaviour {
         private static readonly Queue<Action> _executionQueue = new Queue<Action>();
         private static UnityMainThreadDispatcher _instance = null;
-
-        public static UnityMainThreadDispatcher Instance()
-        {
-            if (_instance == null)
-            {
+        public static UnityMainThreadDispatcher Instance() {
+            if (_instance == null) {
                 GameObject obj = new GameObject("UnityMainThreadDispatcher");
                 _instance = obj.AddComponent<UnityMainThreadDispatcher>();
                 DontDestroyOnLoad(obj);
             }
             return _instance;
         }
-
-        public void Update()
-        {
-            lock (_executionQueue)
-            {
-                while (_executionQueue.Count > 0)
-                {
-                    _executionQueue.Dequeue().Invoke();
-                }
-            }
-        }
-
-        public void Enqueue(Action action)
-        {
-            lock (_executionQueue)
-            {
-                _executionQueue.Enqueue(action);
-            }
-        }
+        public void Update() { lock (_executionQueue) { while (_executionQueue.Count > 0) _executionQueue.Dequeue().Invoke(); } }
+        public void Enqueue(Action action) { lock (_executionQueue) _executionQueue.Enqueue(action); }
     }
 
-    public class GhostVisualizer : MonoBehaviour
-    {
+    public class GhostVisualizer : MonoBehaviour {
         private LineRenderer line;
-
-        private void Awake()
-        {
+        private void Awake() {
             line = gameObject.AddComponent<LineRenderer>();
-            line.useWorldSpace = true;
-            line.startWidth = 1.0f;
-            line.endWidth = 1.0f;
-            line.positionCount = 0;
+            line.useWorldSpace = true; line.startWidth = 1.0f; line.endWidth = 1.0f;
             line.material = new Material(Shader.Find("Sprites/Default"));
-            line.startColor = Color.magenta;
-            line.endColor = Color.magenta;
-            line.sortingOrder = 10000;
+            line.startColor = Color.magenta; line.endColor = Color.magenta;
         }
-
-        public void UpdateLine(List<Vector3> points)
-        {
-            if (points == null) return;
-            Debug.Log($"[AI_DEBUG] Updating Ghost Line with {points.Count} points.");
-            line.positionCount = points.Count;
-            line.SetPositions(points.ToArray());
-        }
+        public void UpdateLine(List<Vector3> points) { line.positionCount = points.Count; line.SetPositions(points.ToArray()); }
     }
 
-    public class RaycastVisualizer : MonoBehaviour
-    {
+    public class RaycastVisualizer : MonoBehaviour {
         private LineRenderer[] lines;
-        private const int RayCount = 13;
-
-        private void Awake()
-        {
-            lines = new LineRenderer[RayCount];
-            for (int i = 0; i < RayCount; i++)
-            {
-                GameObject lineObj = new GameObject($"RayLine_{i}");
-                lineObj.transform.SetParent(this.transform);
-                LineRenderer lr = lineObj.AddComponent<LineRenderer>();
-                lr.useWorldSpace = true;
-                lr.startWidth = 0.05f;
-                lr.endWidth = 0.05f;
-                lr.material = new Material(Shader.Find("Hidden/Internal-Colored"));
-                lr.material.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-                lr.material.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-                lr.material.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
-                lr.material.SetInt("_ZWrite", 0);
-                lines[i] = lr;
+        private void Awake() {
+            lines = new LineRenderer[13];
+            for (int i = 0; i < 13; i++) {
+                GameObject obj = new GameObject($"Ray_{i}");
+                obj.transform.SetParent(this.transform);
+                lines[i] = obj.AddComponent<LineRenderer>();
+                lines[i].useWorldSpace = true; lines[i].startWidth = 0.05f; lines[i].endWidth = 0.05f;
+                lines[i].material = new Material(Shader.Find("Hidden/Internal-Colored"));
             }
         }
-
-        public void UpdateRay(int index, Vector3 start, Vector3 end, bool hasHit)
-        {
-            if (index < 0 || index >= RayCount) return;
-            
-            lines[index].enabled = true;
-            lines[index].SetPosition(0, start);
-            lines[index].SetPosition(1, end);
-            
-            Color color = hasHit ? Color.red : Color.green;
-            lines[index].startColor = color;
-            lines[index].endColor = color;
+        public void UpdateRay(int idx, Vector3 start, Vector3 end, bool hit) {
+            lines[idx].enabled = true; lines[idx].SetPositions(new Vector3[] { start, end });
+            Color c = hit ? Color.red : Color.green;
+            lines[idx].startColor = c; lines[idx].endColor = c;
         }
-
-        private void Update()
-        {
-            if (Plugin.playerCar == null)
-            {
-                foreach (var line in lines) if (line != null) line.enabled = false;
-            }
-        }
+        private void Update() { if (Plugin.playerCar == null) foreach (var l in lines) l.enabled = false; }
     }
 
-    [Serializable]
-    public class AiInput
-    {
-        public float Steering;
-        public bool Brake;
-        public bool ArmsUp;
-        public bool Reset;
-        public bool RequestGhost;
-        public float[][] TargetPositions;
-        public float TrainingTime;
+    public class TargetVisualizer : MonoBehaviour {
+        private GameObject[] markers;
+        private void Awake() {
+            markers = new GameObject[4];
+            for (int i = 0; i < 4; i++) {
+                markers[i] = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                markers[i].name = $"TargetMarker_{i}";
+                markers[i].transform.SetParent(this.transform);
+                markers[i].transform.localScale = Vector3.one * 1.5f;
+                Destroy(markers[i].GetComponent<SphereCollider>());
+                Renderer r = markers[i].GetComponent<Renderer>();
+                r.material = new Material(Shader.Find("Hidden/Internal-Colored"));
+                r.material.color = i == 0 ? Color.yellow : Color.cyan;
+            }
+        }
+        public void UpdateTargets(float[][] positions) {
+            if (positions == null) return;
+            for (int i = 0; i < markers.Length; i++) {
+                if (i < positions.Length) {
+                    markers[i].SetActive(true);
+                    markers[i].transform.position = new Vector3(positions[i][0], positions[i][1], positions[i][2]);
+                } else markers[i].SetActive(false);
+            }
+        }
+        private void Update() { if (Plugin.playerCar == null) foreach (var m in markers) if (m != null) m.SetActive(false); }
+    }
+
+    public class AiInput {
+        public float Steering; public bool Brake; public bool ArmsUp; public bool Reset; public bool RequestGhost;
+        public float[][] TargetPositions; public float TrainingTime;
     }
 }

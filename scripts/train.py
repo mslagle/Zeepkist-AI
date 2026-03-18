@@ -2,10 +2,66 @@ import sys
 import os
 import time
 import torch
+import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecEnv
+from stable_baselines3.common.buffers import RolloutBuffer
 from zeep_env import ZeepkistEnv
+
+class CustomPPO(PPO):
+    """
+    Custom PPO that synchronizes updates with episode resets.
+    This prevents the AI from freezing mid-race.
+    """
+    def collect_rollouts(
+        self,
+        env: VecEnv,
+        callback: BaseCallback,
+        rollout_buffer: RolloutBuffer,
+        n_rollout_steps: int,
+    ) -> bool:
+        assert self._last_obs is not None, "No previous observation"
+        self.policy.set_training_mode(False)
+        n_steps = 0
+        rollout_buffer.reset()
+        callback.on_rollout_start()
+
+        while n_steps < n_rollout_steps:
+            with torch.no_grad():
+                obs_tensor = torch.as_tensor(self._last_obs).to(self.device)
+                actions, values, log_probs = self.policy(obs_tensor)
+            
+            new_obs, rewards, dones, infos = env.step(actions.cpu().numpy())
+            self.num_timesteps += env.num_envs
+            n_steps += 1
+            
+            rollout_buffer.add(self._last_obs, actions, rewards, dones, values, log_probs)
+            self._last_obs = new_obs
+
+            callback.update_child_locals(locals())
+            if callback.on_step() is False:
+                return False
+
+            # SYNC ON RESET: If episode ended and we have enough data, trigger training now.
+            if dones[0] and n_steps >= 1024:
+                print(f"Episode ended (Step {n_steps}). Starting brain update during reset...")
+                break
+                
+        with torch.no_grad():
+            last_values = self.policy.predict_values(torch.as_tensor(new_obs).to(self.device))
+            
+        rollout_buffer.compute_returns_and_advantages(last_values, dones)
+        callback.on_rollout_end()
+        return True
+
+    def train(self) -> None:
+        print("\n" + "-"*42)
+        print("BRAIN UPDATE: Optimizing Neural Network...")
+        start_t = time.time()
+        super().train()
+        print(f"UPDATE COMPLETE: Took {time.time() - start_t:.1f}s")
+        print("-"*42 + "\n")
 
 class Logger(object):
     def __init__(self, filename="zeepkist_training.log"):
@@ -87,14 +143,14 @@ def train():
 
     if model is None:
         print("Creating new model...")
-        model = PPO(
+        model = CustomPPO(
             "MlpPolicy", 
             env, 
             verbose=1, 
             tensorboard_log=log_dir,
             learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
+            n_steps=4096,
+            batch_size=128,
             n_epochs=10,
             gamma=0.99,
             gae_lambda=0.95,
