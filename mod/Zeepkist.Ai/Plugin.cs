@@ -238,11 +238,11 @@ namespace Zeepkist.Ai
             if (EnableAi.Value && CurrentInput != null) {
                 TimeSpan t = TimeSpan.FromSeconds(CurrentInput.TrainingTime);
                 string timeStr = string.Format("{0:D2}:{1:D2}:{2:D2}", (int)t.TotalHours, t.Minutes, t.Seconds);
-                GUIStyle style = new GUIStyle { fontSize = 48, fontStyle = FontStyle.Bold };
+                GUIStyle style = new GUIStyle { fontSize = 72, fontStyle = FontStyle.Bold };
                 style.normal.textColor = Color.black;
-                GUI.Label(new Rect(22, 22, 600, 80), $"Total Training Time: {timeStr}", style);
+                GUI.Label(new Rect(22, 22, 1000, 100), $"Total Training Time: {timeStr}", style);
                 style.normal.textColor = Color.white;
-                GUI.Label(new Rect(20, 20, 600, 80), $"Total Training Time: {timeStr}", style);
+                GUI.Label(new Rect(20, 20, 1000, 100), $"Total Training Time: {timeStr}", style);
             }
         }
 
