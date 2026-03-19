@@ -518,7 +518,22 @@ class ZeepkistEnv(gym.Env):
 
     def step(self, action):
         self.steps_in_episode += 1
-        steering, brake_val, arms_up_val = action[0], action[1], action[2]
+        
+        # --- PD STEERING CONTROLLER ---
+        # Action[0] is 'Desired Lateral Offset' (-1.0 to 1.0 -> -5m to +5m)
+        desired_offset = action[0] * 5.0
+        
+        # Get current state for PID
+        obs = self._get_obs()
+        local_vel_x = obs[0] # Lateral velocity
+        local_pos_x = obs[7] # Current lateral error
+        
+        # PD Calculation
+        kp, kd = 0.6, 0.3
+        steering = ((local_pos_x - desired_offset) * kp) + (local_vel_x * kd)
+        steering = float(np.clip(steering, -1.0, 1.0))
+        
+        brake_val, arms_up_val = action[1], action[2]
         self._send_input(steering, brake_val > 0.5, arms_up_val > 0.5, reset=False)
 
         # Periodically save total cumulative time (every 500 steps)
