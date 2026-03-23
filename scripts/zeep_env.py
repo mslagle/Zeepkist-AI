@@ -285,6 +285,11 @@ class ZeepkistEnv(gym.Env):
 
         return reward
 
+    def force_mod_reset(self):
+        """Sends an immediate reset signal to the mod without advancing the simulation."""
+        print("!!! FORCING MOD RESET FOR BRAIN UPDATE !!!")
+        self._send_input(0.0, False, False, reset=True)
+
     def step(self, action):
         self.steps_in_episode += 1
         steering, brake, arms = action[0], action[1] > 0.5, action[2] > 0.5
@@ -334,6 +339,13 @@ class ZeepkistEnv(gym.Env):
                     else: break
             time.sleep(0.1)
             
+        # Flush telemetry socket to ensure first step() gets fresh data
+        self.telemetry_socket.settimeout(0.0)
+        try:
+            while True: self.telemetry_socket.recv(8192)
+        except: pass
+        self.telemetry_socket.settimeout(0.5)
+
         return self._get_obs(), {}
 
     def _send_input(self, steering, brake, arms, reset=False, request_ghost=False):

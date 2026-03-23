@@ -9,6 +9,63 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from zeep_env import ZeepkistEnv
 
 class CustomPPO(PPO):
+    def collect_rollouts(
+        self,
+        env: "VecEnv",
+        callback: "BaseCallback",
+        rollout_buffer: "RolloutBuffer",
+        n_rollout_steps: int,
+    ) -> bool:
+        # Restore absolute max size at the start of a new collection
+        rollout_buffer.buffer_size = n_rollout_steps
+
+        # If we forced a reset in the last update, perform the actual wait/reset now.
+        if self._last_obs is None:
+            self._last_obs = env.reset()
+
+        assert self._last_obs is not None, "No previous observation"
+        self.policy.set_training_mode(False)
+        n_steps = 0
+        rollout_buffer.reset()
+        callback.on_rollout_start()
+
+        while n_steps < n_rollout_steps:
+            with torch.no_grad():
+                obs_tensor = torch.as_tensor(self._last_obs).to(self.device)
+                actions, values, log_probs = self.policy(obs_tensor)
+            
+            new_obs, rewards, dones, infos = env.step(actions.cpu().numpy())
+            self.num_timesteps += env.num_envs
+            n_steps += 1
+            
+            rollout_buffer.add(self._last_obs, actions, rewards, dones, values, log_probs)
+            self._last_obs = new_obs
+
+            callback.update_child_locals(locals())
+            if callback.on_step() is False:
+                return False
+
+            # SYNC ON RESET: If car crashed/finished and we have enough data (min 1024), update now.
+            if dones[0] and n_steps >= 1024:
+                print(f"Episode ended (Step {n_steps}). Starting brain update during reset...")
+                # TRICK: Tell SB3 the buffer is full at this exact step count
+                rollout_buffer.buffer_size = n_steps
+                rollout_buffer.full = True
+                break
+        
+        # --- FORCE-SYNC RESET ---
+        # Tell the mod to restart the level NOW so it reloads while we optimize.
+        env.envs[0].force_mod_reset()
+        # Force the next rollout to call env.reset()
+        self._last_obs = None
+                
+        with torch.no_grad():
+            last_values = self.policy.predict_values(torch.as_tensor(new_obs).to(self.device))
+            
+        rollout_buffer.compute_returns_and_advantage(last_values, dones)
+        callback.on_rollout_end()
+        return True
+
     def train(self) -> None:
         print("\n" + "-"*42)
         print("BRAIN UPDATE: Optimizing Neural Network...")
