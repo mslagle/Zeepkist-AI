@@ -16,6 +16,7 @@ using ZeepSDK.Level;
 using Newtonsoft.Json;
 using System.Reflection;
 using Zeepkist.Ai.GtrClient;
+using Zeepkist.Ai.GtrClient.Models;
 
 namespace Zeepkist.Ai
 {
@@ -47,7 +48,7 @@ namespace Zeepkist.Ai
         private static bool checkpointReached = false;
 
         private static GtrClient.GtrClient gtrClient;
-        private static List<Vector3> cachedPoints = null;
+        private static List<GhostFrame> cachedFrames = null;
         private static string cachedHash = "";
         private static bool isSendingPoints = false;
         private static float[][] latestTargetPositions = null;
@@ -94,19 +95,18 @@ namespace Zeepkist.Ai
                 string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
                 lastResetReason = "None";
                 
-                if (newHash != currentLevelHash || cachedPoints == null) {
-                    Logger.LogInfo($"[AI_DEBUG] Level setup: Hash={newHash}, CacheReady={cachedPoints != null}. Fetching ghost.");
+                if (newHash != currentLevelHash || cachedFrames == null) {
+                    Logger.LogInfo($"[AI_DEBUG] Level setup: Hash={newHash}, CacheReady={cachedFrames != null}. Fetching ghost.");
                     currentLevelHash = newHash;
                     ghostLoaded = false;
                     lock (ghostLock) { ghostReady = false; currentGhostBinary = null; }
-                    cachedPoints = null;
+                    cachedFrames = null;
                     cachedHash = "";
                     Task.Run(() => FetchAndProcessGhost(currentLevelHash));
                 } else {
                     lock (ghostLock) { ghostReady = true; }
-                    // Redraw the cached ghost line on spawn
-                    if (visualizer != null && ShowGhostPath.Value && cachedPoints != null) {
-                        visualizer.UpdateLine(cachedPoints);
+                    if (visualizer != null && ShowGhostPath.Value && cachedFrames != null) {
+                        visualizer.UpdateLine(cachedFrames.Select(f => f.Position).ToList());
                     }
                 }
             };
@@ -130,17 +130,19 @@ namespace Zeepkist.Ai
                     return;
                 }
                 Logger.LogInfo($"[AI_DEBUG] Downloading/Parsing ghost: {url}");
-                List<Vector3> points = await gtrClient.DownloadAndParseGhost(url);
-                if (points == null) { Logger.LogError("[AI_DEBUG] Ghost parsing failed (returned null)."); return; }
+                List<GhostFrame> frames = await gtrClient.DownloadAndParseGhost(url);
+                if (frames == null) { Logger.LogError("[AI_DEBUG] Ghost parsing failed (returned null)."); return; }
 
-                cachedPoints = points;
+                cachedFrames = frames;
                 cachedHash = hash;
-                Logger.LogInfo($"[AI_DEBUG] Successfully processed {points.Count} points. Updating visualizer.");
+                Logger.LogInfo($"[AI_DEBUG] Successfully processed {frames.Count} points. Updating visualizer.");
 
                 if (visualizer != null && ShowGhostPath.Value) {
-                    UnityMainThreadDispatcher.Instance().Enqueue(() => { visualizer.UpdateLine(points); });
+                    UnityMainThreadDispatcher.Instance().Enqueue(() => { 
+                        visualizer.UpdateLine(frames.Select(f => f.Position).ToList()); 
+                    });
                 }
-                PrepareGhostBinary(points, hash);
+                PrepareGhostBinary(frames, hash);
                 Logger.LogInfo("[AI_DEBUG] ghostReady is now TRUE.");
             } catch (Exception ex) {
                 Logger.LogError($"[AI_DEBUG] Critical error in FetchAndProcessGhost: {ex.Message}");
@@ -215,9 +217,6 @@ namespace Zeepkist.Ai
                             }
                         }
                     }
-                    if (CurrentInput.RequestGhost && cachedPoints != null && cachedHash != "" && !isSendingPoints) {
-                        SendPointsToPython(cachedPoints, cachedHash);
-                    }
                 }
             } catch { }
             try { inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null); } catch { }
@@ -290,6 +289,24 @@ namespace Zeepkist.Ai
                                 friction = grounded.GetCurrentSurface().physics.frictionFront;
                         }
 
+                        // Ground Normal Sensor
+                        Vector3 groundNormal = Vector3.up;
+                        if (Physics.Raycast(transform.position + Vector3.up * 0.5f, Vector3.down, out RaycastHit groundHit, 3.0f)) {
+                            groundNormal = groundHit.normal;
+                        }
+
+                        // Checkpoint Direction (TODO: Find correct property for handler)
+                        Vector3 nextCpDir = transform.forward;
+                        /*
+                        var setups = PlayerManager.Instance?.currentMaster?.carSetups;
+                        if (setups != null && setups.Count > 0 && setups[0].cc != null) {
+                            var handler = setups[0].cc.checkpointHandler;
+                            if (handler != null && handler.nextCheckpoint != null) {
+                                nextCpDir = (handler.nextCheckpoint.transform.position - transform.position).normalized;
+                            }
+                        }
+                        */
+
                         writer.Write(Time.time);
                         writer.Write(transform.position.x); writer.Write(transform.position.y); writer.Write(transform.position.z);
                         writer.Write(transform.rotation.x); writer.Write(transform.rotation.y); writer.Write(transform.rotation.z); writer.Write(transform.rotation.w);
@@ -299,6 +316,11 @@ namespace Zeepkist.Ai
                         writer.Write(true); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(checkpointReached);
                         foreach (float r in rayDistances) writer.Write(r);
                         writer.Write(isSlipping); writer.Write(friction);
+                        
+                        // New Physics Data
+                        writer.Write(groundNormal.x); writer.Write(groundNormal.y); writer.Write(groundNormal.z);
+                        writer.Write(nextCpDir.x); writer.Write(nextCpDir.y); writer.Write(nextCpDir.z);
+
                         writer.Write(currentLevelHash); writer.Write(lastResetReason);
                         checkpointReached = false;
                     } else {
@@ -311,6 +333,8 @@ namespace Zeepkist.Ai
                         writer.Write(false); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(false);
                         for (int i = 0; i < 13; i++) writer.Write(0f);
                         writer.Write(false); writer.Write(1.0f);
+                        writer.Write(0f); writer.Write(1f); writer.Write(0f); // Ground Normal Up
+                        writer.Write(0f); writer.Write(0f); writer.Write(1f); // CP Forward
                         writer.Write(currentLevelHash); writer.Write(lastResetReason);
                     }
                     byte[] bytes = ms.ToArray();
@@ -333,20 +357,26 @@ namespace Zeepkist.Ai
             return dist;
         }
 
-        public void PrepareGhostBinary(List<Vector3> points, string levelHash)
+        public void PrepareGhostBinary(List<GhostFrame> frames, string levelHash)
         {
-            List<float[]> downsampled = new List<float[]>();
-            for (int i = 0; i < points.Count; i += 10)
-                downsampled.Add(new float[] { points[i].x, points[i].y, points[i].z });
+            // Send every 5th frame for precision in loops
+            List<object> data_frames = new List<object>();
+            for (int i = 0; i < frames.Count; i += 5) {
+                data_frames.Add(new {
+                    p = new float[] { frames[i].Position.x, frames[i].Position.y, frames[i].Position.z },
+                    r = new float[] { frames[i].Rotation.x, frames[i].Rotation.y, frames[i].Rotation.z, frames[i].Rotation.w },
+                    s = frames[i].Speed,
+                    a = frames[i].ArmsUp,
+                    b = frames[i].Braking
+                });
+            }
 
-            var data = new { LevelHash = levelHash, FrameCount = downsampled.Count, Points = downsampled };
+            var data = new { LevelHash = levelHash, FrameCount = data_frames.Count, Frames = data_frames };
             byte[] bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(data));
             lock (ghostLock) { currentGhostBinary = bytes; ghostReady = true; }
         }
 
         public void OnDestroy() { harmony?.UnpatchSelf(); inputServer?.Close(); telemetryClient?.Close(); pointsTcpListener?.Stop(); }
-
-        public void SendPointsToPython(List<Vector3> points, string levelHash) { PrepareGhostBinary(points, levelHash); }
 
         [HarmonyPatch(typeof(New_ControlCar), "Update")]
         public static class New_ControlCar_Update_Patch {

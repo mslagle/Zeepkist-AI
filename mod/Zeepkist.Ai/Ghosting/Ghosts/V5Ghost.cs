@@ -28,7 +28,7 @@ public partial class V5Ghost : GhostBase
         _frames = frames;
     }
 
-    protected override int FrameCount => _frames.Count;
+    public override int FrameCount => _frames.Count;
     public override Color Color => _color;
 
     public override void ApplyCosmetics(string steamName)
@@ -38,7 +38,7 @@ public partial class V5Ghost : GhostBase
         SetupCosmetics(cosmetics, steamName, _steamId);
     }
 
-    protected override IFrame GetFrame(int index)
+    public override IFrame GetFrame(int index)
     {
         return _frames[index];
     }

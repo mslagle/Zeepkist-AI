@@ -50,4 +50,13 @@ namespace Zeepkist.Ai.GtrClient.Models
         [JsonProperty("ghostUrl")]
         public string GhostUrl { get; set; }
     }
+
+    public class GhostFrame
+    {
+        public UnityEngine.Vector3 Position;
+        public UnityEngine.Quaternion Rotation;
+        public float Speed;
+        public bool ArmsUp;
+        public bool Braking;
+    }
 }

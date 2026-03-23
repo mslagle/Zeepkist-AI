@@ -11,6 +11,7 @@ using UnityEngine;
 using Zeepkist.Ai.GtrClient.Models;
 using TNRD.Zeepkist.GTR.Ghosting.Readers;
 using TNRD.Zeepkist.GTR.Ghosting.Ghosts;
+using TNRD.Zeepkist.GTR.Ghosting.Recording;
 using BepInEx.Logging;
 
 namespace Zeepkist.Ai.GtrClient
@@ -35,7 +36,7 @@ namespace Zeepkist.Ai.GtrClient
             this.GraphClient = new GraphQLHttpClient(httpClientOptions, new NewtonsoftJsonSerializer(), httpClient);
         }
 
-        public async Task<List<Vector3>> DownloadAndParseGhost(string url)
+        public async Task<List<GhostFrame>> DownloadAndParseGhost(string url)
         {
             try
             {
@@ -52,9 +53,41 @@ namespace Zeepkist.Ai.GtrClient
                     return null;
                 }
 
-                List<Vector3> points = ghost.GetPositions();
-                logger.LogInfo($"[GtrClient] Successfully parsed ghost with {points.Count} points.");
-                return points;
+                List<GhostFrame> frames = new List<GhostFrame>();
+                for (int i = 0; i < ghost.FrameCount; i++)
+                {
+                    IFrame f = ghost.GetFrame(i);
+                    GhostFrame frame = new GhostFrame
+                    {
+                        Position = f.Position,
+                        Rotation = f.Rotation,
+                        Speed = 0f,
+                        ArmsUp = false,
+                        Braking = false
+                    };
+
+                    if (f is V5Ghost.Frame v5)
+                    {
+                        frame.Speed = v5.Speed;
+                        frame.ArmsUp = v5.InputFlags.HasFlagFast(InputFlags.ArmsUp);
+                        frame.Braking = v5.InputFlags.HasFlagFast(InputFlags.Braking);
+                    }
+                    else
+                    {
+                        // Fallback for older formats
+                        if (i > 0)
+                        {
+                            IFrame prev = ghost.GetFrame(i - 1);
+                            float dt = f.Time - prev.Time;
+                            if (dt > 0)
+                                frame.Speed = Vector3.Distance(f.Position, prev.Position) / dt;
+                        }
+                    }
+                    frames.Add(frame);
+                }
+
+                logger.LogInfo($"[GtrClient] Successfully parsed ghost with {frames.Count} frames.");
+                return frames;
             }
             catch (Exception ex)
             {

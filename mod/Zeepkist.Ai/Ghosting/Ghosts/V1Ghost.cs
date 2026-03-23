@@ -16,7 +16,7 @@ public partial class V1Ghost : GhostBase
         _frames = frames;
     }
 
-    protected override int FrameCount => _frames.Count;
+    public override int FrameCount => _frames.Count;
     public override Color Color => Color.white;
 
     public override void ApplyCosmetics(string steamName)
@@ -29,7 +29,7 @@ public partial class V1Ghost : GhostBase
         SetupCosmetics(cosmetics, steamName, 0);
     }
 
-    protected override IFrame GetFrame(int index)
+    public override IFrame GetFrame(int index)
     {
         return _frames[index];
     }

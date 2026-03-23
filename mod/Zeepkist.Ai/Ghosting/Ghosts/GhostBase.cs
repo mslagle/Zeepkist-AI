@@ -8,7 +8,7 @@ public abstract class GhostBase : IGhost
 {
     private int _fixedUpdateFrame;
 
-    protected abstract int FrameCount { get; }
+    public abstract int FrameCount { get; }
 
     protected GhostData Ghost { get; private set; }
 
@@ -81,7 +81,7 @@ public abstract class GhostBase : IGhost
     {
     }
 
-    protected abstract IFrame GetFrame(int index);
+    public abstract IFrame GetFrame(int index);
 
     public List<Vector3> GetPositions()
     {
