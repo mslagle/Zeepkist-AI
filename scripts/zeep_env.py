@@ -348,6 +348,20 @@ class ZeepkistEnv(gym.Env):
 
         return self._get_obs(), {}
 
+    def save_time(self):
+        """Persists total cumulative training time to disk."""
+        total = self.accumulated_time + (time.time() - self.start_session_time)
+        try:
+            with open(self.time_file, "w") as f:
+                f.write(str(total))
+        except Exception as e:
+            print(f"Error saving time file: {e}")
+
+    def close(self):
+        self.save_time()
+        self.telemetry_socket.close()
+        self.input_socket.close()
+
     def _send_input(self, steering, brake, arms, reset=False, request_ghost=False):
         header = struct.pack('<fBBBB', float(steering), 1 if brake else 0, 1 if arms else 0, 1 if reset else 0, 1 if request_ghost else 0)
         total_time = self.accumulated_time + (time.time() - self.start_session_time)

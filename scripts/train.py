@@ -137,10 +137,12 @@ def train():
     try:
         model.learn(total_timesteps=1_000_000_000, progress_bar=True, callback=[checkpoint_callback])
     except KeyboardInterrupt:
-        print("\nSaving progress...")
+        print("\nTraining interrupted by user. Saving progress...")
     finally:
+        print(f"Final save to {model_path}...")
         model.save(model_path)
         env.save(stats_path)
+        env.close() # This now triggers zeep_env.save_time()
         print("Done.")
 
 if __name__ == "__main__":
