@@ -59,6 +59,8 @@ class ZeepkistEnv(gym.Env):
         self.steps_in_episode = 0
         self.stuck_start_time = None
         self.last_steering = 0.0
+        self.episode_reward = 0.0
+        self.last_log_time = time.time()
         
         # Cumulative Time Tracking
         self.start_session_time = time.time()
@@ -283,6 +285,11 @@ class ZeepkistEnv(gym.Env):
         if min_ray < 5.0:
             reward -= (5.0 - min_ray) * 0.5
 
+        # 7. BRAKING PENALTY (Heavy)
+        # Discourage braking unless absolutely necessary for survival
+        if action[1] > 0.5:
+            reward -= 5.0
+
         return reward
 
     def force_mod_reset(self):
@@ -302,19 +309,39 @@ class ZeepkistEnv(gym.Env):
 
         obs = self._get_obs()
         reward = self._calculate_reward(obs, action)
+        self.episode_reward += reward
         
-        # Terminal conditions
+        # Stuck Detection
+        speed = obs[6]
         terminated = False
-        if not self.last_telemetry.get('IsSpawned', False):
-            reason = self.last_telemetry.get('ResetReason', 'Unknown')
-            print(f"Episode Terminated: IsSpawned=False | Reason: {reason}")
-            if reason == "Finished": reward += 1000.0
-            else: reward -= 100.0
-            terminated = True
-            
-        if self.steps_in_episode > 15000: 
-            print("Episode Terminated: Step Limit reached.")
-            terminated = True
+        if speed < 1.0:
+            if self.stuck_start_time is None:
+                self.stuck_start_time = time.time()
+            elif time.time() - self.stuck_start_time > 5.0:
+                print(f"[RESET] Reason: Stuck (Speed < 1.0 for 5s) | Ep Reward: {self.episode_reward:.2f}")
+                terminated = True
+        else:
+            self.stuck_start_time = None
+
+        # Periodic Status Logging (Every 30 seconds)
+        now = time.time()
+        if now - self.last_log_time > 30.0:
+            total_time = self.accumulated_time + (now - self.start_session_time)
+            print(f"[STATUS] Time: {int(total_time)}s | Ep Steps: {self.steps_in_episode} | Ep Reward: {self.episode_reward:.2f}")
+            self.last_log_time = now
+
+        # Terminal conditions
+        if not terminated:
+            if not self.last_telemetry.get('IsSpawned', False):
+                reason = self.last_telemetry.get('ResetReason', 'Unknown')
+                print(f"[RESET] Reason: {reason} | Ep Reward: {self.episode_reward:.2f}")
+                if reason == "Finished": reward += 1000.0
+                else: reward -= 100.0
+                terminated = True
+                
+            if self.steps_in_episode > 15000: 
+                print(f"[RESET] Reason: Step Limit Reached | Ep Reward: {self.episode_reward:.2f}")
+                terminated = True
         
         return obs, reward, terminated, False, {}
 
@@ -323,21 +350,30 @@ class ZeepkistEnv(gym.Env):
         self.steps_in_episode = 0
         self.last_ghost_index = 0
         self.last_steering = 0.0
+        self.episode_reward = 0.0
+        self.stuck_start_time = None
         
-        print("--- RESETTING ---")
+        print("\n--- NEW RACE STARTING ---")
         self._send_input(0, False, False, reset=True)
         
-        # Wait for respawn and ghost
-        while True:
-            if self._receive_telemetry():
-                if self.last_telemetry['IsSpawned']:
-                    level = self.last_telemetry['LevelHash']
-                    if self.ghost_frames is None:
-                        self._send_input(0, False, False, request_ghost=True)
-                        if self._receive_points_from_mod(level):
-                            break
-                    else: break
-            time.sleep(0.1)
+        # Wait for respawn and ghost (with 30s timeout)
+        start_wait = time.time()
+        while time.time() - start_wait < 30.0:
+            try:
+                if self._receive_telemetry():
+                    if self.last_telemetry['IsSpawned']:
+                        level = self.last_telemetry['LevelHash']
+                        if self.ghost_frames is None:
+                            self._send_input(0, False, False, request_ghost=True)
+                            if self._receive_points_from_mod(level):
+                                break
+                        else: break
+                time.sleep(0.1)
+            except KeyboardInterrupt:
+                print("\nReset interrupted by user.")
+                raise
+        else:
+            print("Reset timed out after 30 seconds. Car may not be spawned.")
             
         # Flush telemetry socket to ensure first step() gets fresh data
         self.telemetry_socket.settimeout(0.0)
