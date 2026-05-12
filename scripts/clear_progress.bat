@@ -6,6 +6,8 @@ set MODEL_FILE=%ROOT_DIR%\zeepkist_ai_model.zip
 set STATS_FILE=%ROOT_DIR%\zeepkist_vec_normalize.pkl
 set LOG_DIR=%ROOT_DIR%\zeepkist_logs
 set CHECKPOINT_DIR=%ROOT_DIR%\zeepkist_checkpoints
+set TIME_FILE=%ROOT_DIR%\zeepkist_total_time.txt
+set TRAIN_LOG=%ROOT_DIR%\zeepkist_training.log
 
 echo === Zeepkist AI Progress Reset ===
 echo This will delete ALL current training progress.
@@ -30,6 +32,14 @@ if exist "%CHECKPOINT_DIR%" (
     echo Clearing checkpoints...
     rd /s /q "%CHECKPOINT_DIR%"
     mkdir "%CHECKPOINT_DIR%"
+)
+if exist "%TIME_FILE%" (
+    echo Clearing training time...
+    del "%TIME_FILE%"
+)
+if exist "%TRAIN_LOG%" (
+    echo Clearing training log...
+    del "%TRAIN_LOG%"
 )
 
 echo.

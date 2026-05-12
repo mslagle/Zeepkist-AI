@@ -56,6 +56,7 @@ class ZeepkistEnv(gym.Env):
         self.ghost_frames = None # List of dicts {p, r, s, a, b}
         
         self.last_ghost_index = 0
+        self.max_ghost_index = 0
         self.steps_in_episode = 0
         self.stuck_start_time = None
         self.last_steering = 0.0
@@ -245,50 +246,51 @@ class ZeepkistEnv(gym.Env):
         return np.nan_to_num(obs)
 
     def _calculate_reward(self, obs, action):
-        # 0-2: VelLocal, 7-9: RelGhostPos, 17-19: GroundNormal, 20-22: CPDir
+        # 0-2: VelLocal, 7-9: RelGhostPos, 17-19: GroundNormal, 20-22: CPDir, 47: Grounded
         vel_local = obs[0:3]
         speed = obs[6]
         rel_ghost_pos = obs[7:10]
-        cp_dir_local = obs[20:22] # Simplified to 2D heading for primary reward
+        is_grounded = obs[47] > 0.5
+        ghost_is_braking = obs[16] > 0.5
         
         reward = 0.0
         
-        # 1. DIRECTIONAL VELOCITY (Primary)
+        # 1. PROGRESS REWARD (Primary)
+        # Reward for reaching new furthest points along the ghost path
+        if self.last_ghost_index > self.max_ghost_index:
+            reward += (self.last_ghost_index - self.max_ghost_index) * 5.0
+            self.max_ghost_index = self.last_ghost_index
+        
+        # 2. DIRECTIONAL VELOCITY (Secondary)
         # Reward for moving forward relative to the car's heading
-        reward += vel_local[2] * 0.1
+        reward += vel_local[2] * 0.05
         
-        # 2. PATH ADHERENCE
+        # 3. PATH ADHERENCE
         dist_to_path = np.linalg.norm(rel_ghost_pos)
-        reward += max(0, 1.0 - (dist_to_path / 5.0))
+        reward -= (dist_to_path / 5.0) * 0.1
         
-        # 3. MOMENTUM CONSERVATION (The "Soapbox" Penalty)
-        # Penalize steering more as speed increases
+        # 4. MOMENTUM CONSERVATION
         steering = action[0]
-        reward -= abs(steering) * (speed / 50.0) * 0.5
+        reward -= abs(steering) * (speed / 100.0) * 0.1
         
-        # 4. SWERVING PENALTY
+        # 5. SWERVING PENALTY
         steering_change = abs(steering - self.last_steering)
-        reward -= (steering_change ** 2) * 5.0
+        reward -= (steering_change ** 2) * 2.0
         self.last_steering = steering
         
-        # 5. LANDING / ORIENTATION
-        # If GroundNormal is NOT Up (0,1,0), reward aligning car Up with Ground Normal
+        # 6. LANDING / ORIENTATION
         ground_normal = obs[17:20]
-        car_up = np.array([0, 1, 0]) # In local space, car up is always 0,1,0
-        # We want ground normal (local) to match car up
+        car_up = np.array([0, 1, 0])
         alignment = np.dot(ground_normal, car_up)
-        reward += alignment * 0.2
+        reward += alignment * 0.1
 
-        # 6. OBSTACLE AVOIDANCE
-        rays = obs[23:36]
-        min_ray = np.min(rays)
-        if min_ray < 5.0:
-            reward -= (5.0 - min_ray) * 0.5
-
-        # 7. BRAKING PENALTY (Heavy)
-        # Discourage braking unless absolutely necessary for survival
+        # 7. BRAKING PENALTY (Surgical)
+        # Discourage braking unless in the air or ghost is braking
         if action[1] > 0.5:
-            reward -= 5.0
+            if is_grounded and not ghost_is_braking:
+                reward -= 2.0 # Significant, but not scaling-breaking
+            else:
+                reward -= 0.01 # Jitter penalty
 
         return reward
 
@@ -349,6 +351,7 @@ class ZeepkistEnv(gym.Env):
         super().reset(seed=seed)
         self.steps_in_episode = 0
         self.last_ghost_index = 0
+        self.max_ghost_index = 0
         self.last_steering = 0.0
         self.episode_reward = 0.0
         self.stuck_start_time = None

@@ -21,11 +21,15 @@
 - **Ghost Visualization:** `GhostVisualizer` component uses `LineRenderer` to draw ghost paths (supports uncompressed GTR ghosts).
 
 ## Python Environment (`zeep_env.py`)
-- **Observation Space:** 22-dimensional (relative positions, local velocities, rotation, progress, ghost status).
-- **Reward Function:** Primarily progress-based (reward for reaching new max ghost index). Small speed and proximity bonuses.
+- **Observation Space:** 48-dimensional (Physics-Aware including rays, local velocities, ghost status).
+- **Reward Function:** 
+  - **Progress (Primary):** Reward for reaching new furthest ghost index points.
+  - **Directional Velocity:** Small reward for forward local velocity.
+  - **Path Adherence:** Small penalty for distance from ghost path.
+  - **Braking Penalty (-2.0):** Applied if grounded and GTR ghost is not braking.
+- **Groundedness:** Detected via `SurfaceFriction > 0.1` (Mod reports 0.0 when airborne).
 - **Stuck Detection:** Resets if `speed < 1.0` for > 5 seconds.
 - **Reset Sync:** Waits for `IsSpawned` to transition `True -> False -> True` to ensure clean starts.
-- **Ghost Requirement:** Training will fail if a valid `.zeepghost` file cannot be fetched and parsed.
 
 ## GTR API & Parsing
 - **GraphQL:** Endpoint `https://graphql.zeepki.st`. Path: `levels -> records -> recordMedia -> ghostUrl`.

@@ -281,12 +281,15 @@ namespace Zeepkist.Ai
                         }
 
                         bool isSlipping = false;
-                        float friction = 1.0f;
+                        float friction = 0.0f;
                         if (playerCar.wheels != null) {
                             isSlipping = playerCar.wheels.Any(x => x != null && x.IsGrounded() && x.IsSlipping());
                             var grounded = playerCar.wheels.FirstOrDefault(x => x != null && x.IsGrounded());
-                            if (grounded?.GetCurrentSurface()?.physics != null)
-                                friction = grounded.GetCurrentSurface().physics.frictionFront;
+                            if (grounded != null) {
+                                friction = 1.0f;
+                                if (grounded.GetCurrentSurface()?.physics != null)
+                                    friction = grounded.GetCurrentSurface().physics.frictionFront;
+                            }
                         }
 
                         // Ground Normal Sensor

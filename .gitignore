@@ -399,3 +399,5 @@ FodyWeavers.xsd
 zeepkist_logs/
 zeepkist_checkpoints/*.zip
 scripts/ghosts/
+scripts/checkpoints/*.zip
+scripts/checkpoints/
