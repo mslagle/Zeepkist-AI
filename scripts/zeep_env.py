@@ -265,13 +265,14 @@ class ZeepkistEnv(gym.Env):
         # Reward for moving forward relative to the car's heading
         reward += vel_local[2] * 0.05
         
-        # 3. PATH ADHERENCE
+        # 3. PATH ADHERENCE (Crucial)
+        # Penalize distance from path non-linearly
         dist_to_path = np.linalg.norm(rel_ghost_pos)
-        reward -= (dist_to_path / 5.0) * 0.1
+        reward -= (dist_to_path ** 2) * 0.5 
         
         # 4. MOMENTUM CONSERVATION
         steering = action[0]
-        reward -= abs(steering) * (speed / 100.0) * 0.1
+        reward -= abs(steering) * (speed / 100.0) * 0.05
         
         # 5. SWERVING PENALTY
         steering_change = abs(steering - self.last_steering)
