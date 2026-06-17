@@ -38,6 +38,8 @@ class CustomPPO(PPO):
             self.num_timesteps += env.num_envs
             n_steps += 1
             
+            self._update_info_buffer(infos, dones)
+            
             rollout_buffer.add(self._last_obs, actions, rewards, dones, values, log_probs)
             self._last_obs = new_obs
 
@@ -55,7 +57,7 @@ class CustomPPO(PPO):
         
         # --- FORCE-SYNC RESET ---
         # Tell the mod to restart the level NOW so it reloads while we optimize.
-        env.envs[0].force_mod_reset()
+        env.envs[0].unwrapped.force_mod_reset()
         # Force the next rollout to call env.reset()
         self._last_obs = None
                 
@@ -84,7 +86,9 @@ class Logger(object):
     def flush(self):
         self.terminal.flush(); self.log.flush()
 
-def make_env(): return ZeepkistEnv()
+from stable_baselines3.common.monitor import Monitor
+
+def make_env(): return Monitor(ZeepkistEnv())
 
 def train():
     sys.stdout = Logger("zeepkist_training.log")
@@ -119,7 +123,7 @@ def train():
     if os.path.exists(model_path + ".zip"):
         print("Loading existing model...")
         try:
-            model = CustomPPO.load(model_path, env=env)
+            model = CustomPPO.load(model_path, env=env, tensorboard_log="../zeepkist_logs")
             model.n_steps = target_n_steps
             model.batch_size = target_batch_size
             # Rebuild buffer to match new observation space and size
@@ -135,7 +139,8 @@ def train():
         model = CustomPPO(
             "MlpPolicy", env, verbose=1,
             learning_rate=3e-4, n_steps=target_n_steps, batch_size=target_batch_size,
-            n_epochs=10, gamma=0.99, gae_lambda=0.95, ent_coef=0.01
+            n_epochs=10, gamma=0.99, gae_lambda=0.95, ent_coef=0.01,
+            tensorboard_log="../zeepkist_logs"
         )
 
     checkpoint_callback = CheckpointCallback(save_freq=SAVE_FREQ, save_path="./checkpoints/", name_prefix="zeep_physics")

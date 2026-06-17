@@ -150,6 +150,7 @@ class ZeepkistEnv(gym.Env):
 
             t['Rays'] = [read_float() for _ in range(75)]
             t['IsSlipping'] = read_bool()
+            t['IsGrounded'] = read_bool()
             t['SurfaceFriction'] = read_float()
             
             t['GroundNormal'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
@@ -165,7 +166,7 @@ class ZeepkistEnv(gym.Env):
                 self.ghost_frames = None
                 
             return True
-        except: return False
+        except Exception: return False
 
     def _rotate_to_local(self, world_vec, quat):
         # Unity Quat: [x, y, z, w] -> Inverse: [-x, -y, -z, w]
@@ -174,6 +175,20 @@ class ZeepkistEnv(gym.Env):
         v = np.array(world_vec)
         a = np.cross(q_vec, v) + w * v
         return v + 2 * np.cross(q_vec, a)
+
+    def _relative_quaternion(self, q_car, q_ghost):
+        # q_car (t['Rotation']): {'x':..., 'y':..., 'z':..., 'w':...}
+        # q_ghost (gf['r']): list [x,y,z,w]
+        # Calculate q_inv = [-q_car.x, -q_car.y, -q_car.z, q_car.w]
+        ax, ay, az, aw = -q_car['x'], -q_car['y'], -q_car['z'], q_car['w']
+        bx, by, bz, bw = q_ghost[0], q_ghost[1], q_ghost[2], q_ghost[3]
+        
+        # Hamilton product: q_inv * q_ghost
+        x = aw * bx + ax * bw + ay * bz - az * by
+        y = aw * by - ax * bz + ay * bw + az * bx
+        z = aw * bz + ax * by - ay * bx + az * bw
+        w = aw * bw - ax * bx - ay * by - az * bz
+        return np.array([x, y, z, w], dtype=np.float32)
 
     def _get_obs(self):
         t = self.last_telemetry
@@ -185,7 +200,7 @@ class ZeepkistEnv(gym.Env):
         
         # 1. Local Dynamics
         vel_local = self._rotate_to_local([t['Velocity']['x'], t['Velocity']['y'], t['Velocity']['z']], car_quat)
-        ang_vel_local = [t['AngularVelocity']['x'], t['AngularVelocity']['y'], t['AngularVelocity']['z']]
+        ang_vel_local = self._rotate_to_local([t['AngularVelocity']['x'], t['AngularVelocity']['y'], t['AngularVelocity']['z']], car_quat)
         
         # 2. Ghost Matching
         rel_ghost_pos = np.zeros(3)
@@ -216,8 +231,7 @@ class ZeepkistEnv(gym.Env):
             gf = self.ghost_frames[self.last_ghost_index]
             rel_ghost_pos = self._rotate_to_local(gf['p'] - car_pos, car_quat)
             # Relative Rotation (Ghost Quat * Inverse Car Quat)
-            # For simplicity in ML, we'll just feed the ghost's local rotation
-            rel_ghost_rot = gf['r'] # [x,y,z,w]
+            rel_ghost_rot = self._relative_quaternion(car_quat, gf['r'])
             ghost_speed = gf['s']
             ghost_flags = [1.0 if gf['a'] else 0.0, 1.0 if gf['b'] else 0.0]
             
@@ -240,7 +254,7 @@ class ZeepkistEnv(gym.Env):
             lookahead1, lookahead2,
             [self.last_steering], [1.0 if t['IsSlipping'] else 0.0], [t['SurfaceFriction']],
             [progress], [1.0 if self.ghost_frames else 0.0],
-            [1.0 if t['SurfaceFriction'] > 0.1 else 0.0] # Groundedness
+            [1.0 if t['IsGrounded'] else 0.0] # Groundedness
         ]).astype(np.float32)
         
         return np.nan_to_num(obs)
@@ -251,25 +265,22 @@ class ZeepkistEnv(gym.Env):
         vel_local = obs[0:3]
         speed = obs[6]
         rel_ghost_pos = obs[7:10]
-        is_grounded = obs[109] > 0.5 # Shifted from 71
+        is_grounded = obs[109] > 0.5
         ghost_is_braking = obs[16] > 0.5
         
         reward = 0.0
         
         # 1. PROGRESS REWARD (Primary)
-        # Reward for reaching new furthest points along the ghost path
         if self.last_ghost_index > self.max_ghost_index:
             reward += (self.last_ghost_index - self.max_ghost_index) * 5.0
             self.max_ghost_index = self.last_ghost_index
         
         # 2. DIRECTIONAL VELOCITY (Secondary)
-        # Reward for moving forward relative to the car's heading
         reward += vel_local[2] * 0.05
         
-        # 3. PATH ADHERENCE (Crucial)
-        # Penalize distance from path non-linearly
+        # 3. PATH ADHERENCE (Capped to prevent domination)
         dist_to_path = np.linalg.norm(rel_ghost_pos)
-        reward -= (dist_to_path ** 2) * 0.5 
+        reward -= min(dist_to_path * 0.1, 1.5)
         
         # 4. MOMENTUM CONSERVATION
         steering = action[0]
@@ -286,13 +297,24 @@ class ZeepkistEnv(gym.Env):
         alignment = np.dot(ground_normal, car_up)
         reward += alignment * 0.1
 
-        # 7. BRAKING PENALTY (Surgical)
-        # Discourage braking unless in the air or ghost is braking
-        if action[1] > 0.5:
-            if is_grounded and not ghost_is_braking:
-                reward -= 2.0 # Significant, but not scaling-breaking
+        # 7. BRAKING PENALTY (Continuous & Surgical)
+        brake_input = action[1]
+        if brake_input > 0.01:
+            if is_grounded:
+                if not ghost_is_braking:
+                    reward -= brake_input * 5.0  # Heavily penalize braking on the ground
+                else:
+                    reward -= brake_input * 0.1  # Very light penalty if ghost is braking
             else:
-                reward -= 0.01 # Jitter penalty
+                # In the air: penalize braking only if the car is stable
+                ang_vel_mag = np.linalg.norm(obs[3:6])
+                spin_factor = max(0.0, 1.0 - ang_vel_mag / 1.0)
+                reward -= brake_input * spin_factor * 1.0
+
+        # 7.5 AIR SPIN PENALTY
+        if not is_grounded:
+            ang_vel_mag = np.linalg.norm(obs[3:6])
+            reward -= ang_vel_mag * 0.05
 
         # 8. OBSTACLE AVOIDANCE (Multi-Layer)
         # Use 75 SphereCasts (obs 23-97) to penalize proximity to walls/obstacles
@@ -315,11 +337,11 @@ class ZeepkistEnv(gym.Env):
     def force_mod_reset(self):
         """Sends an immediate reset signal to the mod without advancing the simulation."""
         print("!!! FORCING MOD RESET FOR BRAIN UPDATE !!!")
-        self._send_input(0.0, False, False, reset=True)
+        self._send_input(0.0, 0.0, 0.0, reset=True)
 
     def step(self, action):
         self.steps_in_episode += 1
-        steering, brake, arms = action[0], action[1] > 0.5, action[2] > 0.5
+        steering, brake, arms = action[0], action[1], action[2]
         
         # 1:1 Direct Input
         self._send_input(steering, brake, arms)
@@ -375,7 +397,7 @@ class ZeepkistEnv(gym.Env):
         self.stuck_start_time = None
         
         print("\n--- NEW RACE STARTING ---")
-        self._send_input(0, False, False, reset=True)
+        self._send_input(0.0, 0.0, 0.0, reset=True)
         
         # Wait for respawn and ghost (with 30s timeout)
         start_wait = time.time()
@@ -385,7 +407,7 @@ class ZeepkistEnv(gym.Env):
                     if self.last_telemetry['IsSpawned']:
                         level = self.last_telemetry['LevelHash']
                         if self.ghost_frames is None:
-                            self._send_input(0, False, False, request_ghost=True)
+                            self._send_input(0.0, 0.0, 0.0, request_ghost=True)
                             if self._receive_points_from_mod(level):
                                 break
                         else: break
@@ -400,7 +422,7 @@ class ZeepkistEnv(gym.Env):
         self.telemetry_socket.settimeout(0.0)
         try:
             while True: self.telemetry_socket.recv(8192)
-        except: pass
+        except Exception: pass
         self.telemetry_socket.settimeout(0.5)
 
         return self._get_obs(), {}
@@ -420,9 +442,9 @@ class ZeepkistEnv(gym.Env):
         self.input_socket.close()
 
     def _send_input(self, steering, brake, arms, reset=False, request_ghost=False):
-        header = struct.pack('<fBBBB', float(steering), 1 if brake else 0, 1 if arms else 0, 1 if reset else 0, 1 if request_ghost else 0)
+        header = struct.pack('<fffBB', float(steering), float(brake), float(arms), 1 if reset else 0, 1 if request_ghost else 0)
         total_time = self.accumulated_time + (time.time() - self.start_session_time)
         input_data = {"p": [[0,0,0]]*4, "t": round(total_time, 1)}
         msg = header + json.dumps(input_data).encode('utf-8')
         try: self.input_socket.sendto(msg, (self.host, self.input_port))
-        except: pass
+        except Exception: pass

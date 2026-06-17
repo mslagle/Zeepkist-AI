@@ -28,6 +28,7 @@ namespace Zeepkist.Ai
 
         public static ConfigEntry<bool> EnableAi { get; private set; }
         public static ConfigEntry<bool> ShowGhostPath { get; private set; }
+        public static ConfigEntry<float> GameSpeed { get; private set; }
         public static ConfigEntry<int> TelemetryPort { get; private set; }
         public static ConfigEntry<int> InputPort { get; private set; }
         public static ConfigEntry<int> PointsTcpPort { get; private set; }
@@ -68,6 +69,7 @@ namespace Zeepkist.Ai
             harmony.PatchAll();
 
             EnableAi = Config.Bind<bool>("AI", "Enable AI control", false);
+            GameSpeed = Config.Bind<float>("AI", "Game Speed Multiplier", 1.0f);
             ShowGhostPath = Config.Bind<bool>("Visuals", "Show GTR Ghost Path", true);
             TelemetryPort = Config.Bind<int>("Network", "Telemetry Port", 9090);
             InputPort = Config.Bind<int>("Network", "Input Port", 9091);
@@ -193,23 +195,23 @@ namespace Zeepkist.Ai
         {
             try {
                 byte[] bytes = inputServer.EndReceive(res, ref inputEndPoint);
-                if (bytes.Length >= 8) {
+                if (bytes.Length >= 14) {
                     lastInputTime = DateTime.Now;
                     using (MemoryStream ms = new MemoryStream(bytes))
                     using (BinaryReader reader = new BinaryReader(ms)) {
                         CurrentInput.Steering = reader.ReadSingle();
-                        CurrentInput.Brake = reader.ReadBoolean();
-                        CurrentInput.ArmsUp = reader.ReadBoolean();
+                        CurrentInput.Brake = reader.ReadSingle();
+                        CurrentInput.ArmsUp = reader.ReadSingle();
                         CurrentInput.Reset = reader.ReadBoolean();
                         CurrentInput.RequestGhost = reader.ReadBoolean();
                         
                         inputPacketCount++;
                         if (inputPacketCount % 500 == 0) {
-                            Logger.LogInfo($"[AI_DEBUG] Recv Input: Steer={CurrentInput.Steering:F2}, Brake={CurrentInput.Brake}");
+                            Logger.LogInfo($"[AI_DEBUG] Recv Input: Steer={CurrentInput.Steering:F2}, Brake={CurrentInput.Brake:F2}, Arms={CurrentInput.ArmsUp:F2}");
                         }
 
-                        if (bytes.Length > 8) {
-                            string json = Encoding.UTF8.GetString(bytes, 8, bytes.Length - 8);
+                        if (bytes.Length > 14) {
+                            string json = Encoding.UTF8.GetString(bytes, 14, bytes.Length - 14);
                             var data = JsonConvert.DeserializeObject<JsonInputData>(json);
                             if (data != null) {
                                 lock (targetLock) { latestTargetPositions = data.p; }
@@ -227,6 +229,15 @@ namespace Zeepkist.Ai
             if (Input.GetKeyDown(KeyCode.F9)) {
                 EnableAi.Value = !EnableAi.Value;
                 Logger.LogInfo($"[AI_DEBUG] AI CONTROL: {(EnableAi.Value ? "ENABLED" : "DISABLED")}");
+                if (!EnableAi.Value) Time.timeScale = 1.0f;
+            }
+
+            if (EnableAi.Value && Input.GetKeyDown(KeyCode.F10)) {
+                if (GameSpeed.Value == 1.0f) GameSpeed.Value = 1.5f;
+                else if (GameSpeed.Value == 1.5f) GameSpeed.Value = 2.0f;
+                else if (GameSpeed.Value == 2.0f) GameSpeed.Value = 3.0f;
+                else GameSpeed.Value = 1.0f;
+                Logger.LogInfo($"[AI_DEBUG] GAME SPEED: {GameSpeed.Value}x");
             }
 
             if (latestTargetPositions != null && targetVisualizer != null) {
@@ -251,7 +262,14 @@ namespace Zeepkist.Ai
 
         private void FixedUpdate()
         {
-            if (!EnableAi.Value) return;
+            if (!EnableAi.Value) {
+                if (Time.timeScale != 1.0f) Time.timeScale = 1.0f;
+                return;
+            }
+
+            if (Time.timeScale != GameSpeed.Value) {
+                Time.timeScale = GameSpeed.Value;
+            }
 
             // Heartbeat: If Python pauses (training), hold last steering but don't reset.
             bool isPaused = (DateTime.Now - lastInputTime).TotalMilliseconds > 500;
@@ -290,10 +308,12 @@ namespace Zeepkist.Ai
 
                         bool isSlipping = false;
                         float friction = 0.0f;
+                        bool isGrounded = false;
                         if (playerCar.wheels != null) {
                             isSlipping = playerCar.wheels.Any(x => x != null && x.IsGrounded() && x.IsSlipping());
                             var grounded = playerCar.wheels.FirstOrDefault(x => x != null && x.IsGrounded());
                             if (grounded != null) {
+                                isGrounded = true;
                                 friction = 1.0f;
                                 if (grounded.GetCurrentSurface()?.physics != null)
                                     friction = grounded.GetCurrentSurface().physics.frictionFront;
@@ -326,7 +346,9 @@ namespace Zeepkist.Ai
                         writer.Write(playerCar.rb.velocity.magnitude);
                         writer.Write(true); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(checkpointReached);
                         foreach (float r in rayDistances) writer.Write(r);
-                        writer.Write(isSlipping); writer.Write(friction);
+                        writer.Write(isSlipping);
+                        writer.Write(isGrounded);
+                        writer.Write(friction);
                         
                         // New Physics Data
                         writer.Write(groundNormal.x); writer.Write(groundNormal.y); writer.Write(groundNormal.z);
@@ -343,7 +365,9 @@ namespace Zeepkist.Ai
                         writer.Write(0f);
                         writer.Write(false); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(false);
                         for (int i = 0; i < 75; i++) writer.Write(0f);
-                        writer.Write(false); writer.Write(1.0f);
+                        writer.Write(false);
+                        writer.Write(false);
+                        writer.Write(1.0f);
                         writer.Write(0f); writer.Write(1f); writer.Write(0f); // Ground Normal Up
                         writer.Write(0f); writer.Write(0f); writer.Write(1f); // CP Forward
                         writer.Write(currentLevelHash); writer.Write(lastResetReason);
@@ -399,9 +423,9 @@ namespace Zeepkist.Ai
             public static void Postfix(New_ControlCar __instance) {
                 if (EnableAi.Value && CurrentInput != null && playerCar != null && __instance == playerCar) {
                     if (__instance.SteerAction2 != null) __instance.SteerAction2.axis = CurrentInput.Steering;
-                    if (__instance.BrakeAction2 != null) { __instance.BrakeAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f; __instance.BrakeAction2.buttonHeld = CurrentInput.Brake; }
-                    if (__instance.PitchBackwardAction2 != null) { __instance.PitchBackwardAction2.axis = CurrentInput.Brake ? 1.0f : 0.0f; __instance.PitchBackwardAction2.buttonHeld = CurrentInput.Brake; }
-                    if (__instance.ArmsUpAction2 != null) { __instance.ArmsUpAction2.axis = CurrentInput.ArmsUp ? 1.0f : 0.0f; __instance.ArmsUpAction2.buttonHeld = CurrentInput.ArmsUp; }
+                    if (__instance.BrakeAction2 != null) { __instance.BrakeAction2.axis = CurrentInput.Brake; __instance.BrakeAction2.buttonHeld = CurrentInput.Brake > 0.5f; }
+                    if (__instance.PitchBackwardAction2 != null) { __instance.PitchBackwardAction2.axis = CurrentInput.Brake; __instance.PitchBackwardAction2.buttonHeld = CurrentInput.Brake > 0.5f; }
+                    if (__instance.ArmsUpAction2 != null) { __instance.ArmsUpAction2.axis = CurrentInput.ArmsUp; __instance.ArmsUpAction2.buttonHeld = CurrentInput.ArmsUp > 0.5f; }
                 }
             }
         }
@@ -443,21 +467,23 @@ namespace Zeepkist.Ai
                 GameObject obj = new GameObject($"Ray_{i}");
                 obj.transform.SetParent(this.transform);
                 lines[i] = obj.AddComponent<LineRenderer>();
-                lines[i].useWorldSpace = true; lines[i].startWidth = 0.05f; lines[i].endWidth = 0.05f;
-                // Use a shader that supports ZTest Off to ensure visibility
-                lines[i].material = new Material(Shader.Find("GUI/Text Shader"));
-                lines[i].material.renderQueue = 4000;
+                lines[i].useWorldSpace = true;
+                lines[i].positionCount = 2;
+                lines[i].startWidth = 0.15f; lines[i].endWidth = 0.15f;
+                lines[i].material = new Material(Shader.Find("Sprites/Default"));
             }
         }
         public void UpdateRay(int idx, Vector3 start, Vector3 end, bool hit) {
-            lines[idx].enabled = true; lines[idx].SetPositions(new Vector3[] { start, end });
+            if (lines == null || idx < 0 || idx >= lines.Length || lines[idx] == null) return;
+            lines[idx].enabled = true;
+            lines[idx].SetPositions(new Vector3[] { start, end });
             Color c;
             if (idx < 25) c = Color.blue;
             else if (idx < 50) c = Color.green;
             else c = Color.magenta;
             
             if (hit) c = Color.red;
-            c.a = 0.5f;
+            c.a = 0.8f;
             lines[idx].startColor = c; lines[idx].endColor = c;
         }
         private void Update() { 
@@ -494,7 +520,7 @@ namespace Zeepkist.Ai
     }
 
     public class AiInput {
-        public float Steering; public bool Brake; public bool ArmsUp; public bool Reset; public bool RequestGhost;
+        public float Steering; public float Brake; public float ArmsUp; public bool Reset; public bool RequestGhost;
         public float[][] TargetPositions; public float TrainingTime;
     }
 }
