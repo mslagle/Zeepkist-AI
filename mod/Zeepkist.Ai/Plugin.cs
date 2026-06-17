@@ -272,12 +272,20 @@ namespace Zeepkist.Ai
                 using (BinaryWriter writer = new BinaryWriter(ms)) {
                     if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null) {
                         var transform = playerCar.transform;
-                        float[] rayDistances = new float[13];
-                        for (int i = 0; i < 13; i++) {
-                            float angle = -60f + (i * 10f);
-                            Vector3 dir = Quaternion.Euler(0, angle, 0) * transform.forward;
-                            float range = Mathf.Lerp(100f, 20f, Mathf.Abs(angle) / 60f);
-                            rayDistances[i] = GetRaycast(dir, range, i);
+                        float[] rayDistances = new float[75];
+                        
+                        // 3 Layers: Low (-15 deg), Mid (0 deg), High (+15 deg)
+                        for (int layer = 0; layer < 3; layer++) {
+                            float pitch = -15f + (layer * 15f);
+                            for (int i = 0; i < 25; i++) {
+                                int idx = (layer * 25) + i;
+                                float yaw = -60f + (i * (120f / 24f));
+                                // Make direction truly local to the car
+                                Vector3 localDir = Quaternion.Euler(pitch, yaw, 0) * Vector3.forward;
+                                Vector3 dir = transform.TransformDirection(localDir);
+                                float range = Mathf.Lerp(100f, 20f, Mathf.Abs(yaw) / 60f);
+                                rayDistances[idx] = GetSphereCast(dir, range, idx);
+                            }
                         }
 
                         bool isSlipping = false;
@@ -334,7 +342,7 @@ namespace Zeepkist.Ai
                         writer.Write(0f); writer.Write(0f); writer.Write(0f);
                         writer.Write(0f);
                         writer.Write(false); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(false);
-                        for (int i = 0; i < 13; i++) writer.Write(0f);
+                        for (int i = 0; i < 75; i++) writer.Write(0f);
                         writer.Write(false); writer.Write(1.0f);
                         writer.Write(0f); writer.Write(1f); writer.Write(0f); // Ground Normal Up
                         writer.Write(0f); writer.Write(0f); writer.Write(1f); // CP Forward
@@ -346,15 +354,20 @@ namespace Zeepkist.Ai
             } catch { }
         }
 
-        private float GetRaycast(Vector3 direction, float maxDist, int index = -1)
+        private float GetSphereCast(Vector3 direction, float maxDist, int index = -1)
         {
             if (playerCar == null) return maxDist;
-            Vector3 origin = playerCar.transform.position + Vector3.up * 0.5f;
+            Vector3 origin = playerCar.transform.position + playerCar.transform.up * 0.5f;
             RaycastHit hit;
             float dist = maxDist;
             bool isObstacle = false;
-            if (Physics.Raycast(origin, direction, out hit, maxDist)) {
-                if (Mathf.Abs(hit.normal.y) < 0.8f) { dist = hit.distance; isObstacle = true; }
+            
+            // Ignore the player car layer
+            int layerMask = ~(1 << playerCar.gameObject.layer);
+            
+            if (Physics.SphereCast(origin, 0.75f, direction, out hit, maxDist, layerMask)) {
+                dist = hit.distance;
+                if (Mathf.Abs(hit.normal.y) < 0.8f) { isObstacle = true; }
             }
             if (rayVisualizer != null && index >= 0) rayVisualizer.UpdateRay(index, origin, origin + direction * dist, isObstacle);
             return dist;
@@ -425,21 +438,32 @@ namespace Zeepkist.Ai
     public class RaycastVisualizer : MonoBehaviour {
         private LineRenderer[] lines;
         private void Awake() {
-            lines = new LineRenderer[13];
-            for (int i = 0; i < 13; i++) {
+            lines = new LineRenderer[75];
+            for (int i = 0; i < 75; i++) {
                 GameObject obj = new GameObject($"Ray_{i}");
                 obj.transform.SetParent(this.transform);
                 lines[i] = obj.AddComponent<LineRenderer>();
                 lines[i].useWorldSpace = true; lines[i].startWidth = 0.05f; lines[i].endWidth = 0.05f;
-                lines[i].material = new Material(Shader.Find("Hidden/Internal-Colored"));
+                // Use a shader that supports ZTest Off to ensure visibility
+                lines[i].material = new Material(Shader.Find("GUI/Text Shader"));
+                lines[i].material.renderQueue = 4000;
             }
         }
         public void UpdateRay(int idx, Vector3 start, Vector3 end, bool hit) {
             lines[idx].enabled = true; lines[idx].SetPositions(new Vector3[] { start, end });
-            Color c = hit ? Color.red : Color.green;
+            Color c;
+            if (idx < 25) c = Color.blue;
+            else if (idx < 50) c = Color.green;
+            else c = Color.magenta;
+            
+            if (hit) c = Color.red;
+            c.a = 0.5f;
             lines[idx].startColor = c; lines[idx].endColor = c;
         }
-        private void Update() { if (Plugin.playerCar == null) foreach (var l in lines) l.enabled = false; }
+        private void Update() { 
+            bool show = Plugin.playerCar != null && Plugin.EnableAi.Value;
+            foreach (var l in lines) if (l != null) l.enabled = show; 
+        }
     }
 
     public class TargetVisualizer : MonoBehaviour {

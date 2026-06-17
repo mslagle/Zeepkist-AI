@@ -42,7 +42,7 @@ class ZeepkistEnv(gym.Env):
         # 45: Progress (0.0 to 1.0)
         # 46: Ghost Loaded (Binary)
         # 47: Groundedness (Derived from rays/friction)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(48,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(110,), dtype=np.float32)
 
         # Network setup
         self.telemetry_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -147,8 +147,8 @@ class ZeepkistEnv(gym.Env):
             t['GhostLoaded'] = read_bool()
             t['GhostReady'] = read_bool()
             t['CheckpointReached'] = read_bool()
-            
-            t['Rays'] = [read_float() for _ in range(13)]
+
+            t['Rays'] = [read_float() for _ in range(75)]
             t['IsSlipping'] = read_bool()
             t['SurfaceFriction'] = read_float()
             
@@ -178,7 +178,7 @@ class ZeepkistEnv(gym.Env):
     def _get_obs(self):
         t = self.last_telemetry
         if not t or not t.get('IsSpawned', False):
-            return np.zeros(48, dtype=np.float32)
+            return np.zeros(110, dtype=np.float32)
 
         car_pos = np.array([t['Position']['x'], t['Position']['y'], t['Position']['z']])
         car_quat = t['Rotation']
@@ -246,11 +246,12 @@ class ZeepkistEnv(gym.Env):
         return np.nan_to_num(obs)
 
     def _calculate_reward(self, obs, action):
-        # 0-2: VelLocal, 7-9: RelGhostPos, 17-19: GroundNormal, 20-22: CPDir, 47: Grounded
+        # 0-2: VelLocal, 7-9: RelGhostPos, 17-19: GroundNormal, 20-22: CPDir
+        # Rays: 23-97 (75 rays)
         vel_local = obs[0:3]
         speed = obs[6]
         rel_ghost_pos = obs[7:10]
-        is_grounded = obs[47] > 0.5
+        is_grounded = obs[109] > 0.5 # Shifted from 71
         ghost_is_braking = obs[16] > 0.5
         
         reward = 0.0
@@ -292,6 +293,22 @@ class ZeepkistEnv(gym.Env):
                 reward -= 2.0 # Significant, but not scaling-breaking
             else:
                 reward -= 0.01 # Jitter penalty
+
+        # 8. OBSTACLE AVOIDANCE (Multi-Layer)
+        # Use 75 SphereCasts (obs 23-97) to penalize proximity to walls/obstacles
+        rays = obs[23:98]
+        proximity_penalty = 0.0
+        for layer in range(3):
+            layer_rays = rays[layer*25 : (layer+1)*25]
+            for i, r in enumerate(layer_rays):
+                if r < 4.0:
+                    # Front-facing rays in each layer (indices 8-16) have higher weight
+                    weight = 1.0 if (8 <= i <= 16) else 0.5
+                    # Higher layers have slightly lower penalty (overhangs are less scary than floor rocks)
+                    layer_mult = 1.0 if layer == 1 else 0.7 
+                    proximity_penalty += weight * layer_mult * (4.0 - r)
+                    
+        reward -= proximity_penalty * 0.03 # Tuned for 75 rays
 
         return reward
 
