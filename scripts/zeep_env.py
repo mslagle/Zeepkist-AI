@@ -203,7 +203,7 @@ class ZeepkistEnv(gym.Env):
         t = self.last_telemetry
         if not t or not t.get('IsSpawned', False):
             self.fallen_off = False
-            return np.zeros(110, dtype=np.float32)
+            return np.zeros(35, dtype=np.float32)
 
         car_pos = np.array([t['Position']['x'], t['Position']['y'], t['Position']['z']])
         car_quat = t['Rotation']
@@ -419,12 +419,16 @@ class ZeepkistEnv(gym.Env):
         self._send_input(0.0, 0.0, 0.0, reset=True, spawn_index=spawn_index)
         
         # 1. Wait for IsSpawned to become False (ensure reset processed)
+        self.telemetry_socket.settimeout(0.02)
         start_wait_false = time.time()
         while time.time() - start_wait_false < 3.0:
             if self._receive_telemetry():
                 if not self.last_telemetry.get('IsSpawned', False):
                     break
-            time.sleep(0.05)
+            else:
+                # Timeout occurred, meaning no packets are coming (level is loading)
+                break
+        self.telemetry_socket.settimeout(0.5)
 
         # 2. Wait for IsSpawned to become True (ensure car spawned)
         start_wait_true = time.time()

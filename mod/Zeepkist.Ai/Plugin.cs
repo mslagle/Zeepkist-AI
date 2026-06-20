@@ -372,7 +372,7 @@ namespace Zeepkist.Ai
             try {
                 using (MemoryStream ms = new MemoryStream())
                 using (BinaryWriter writer = new BinaryWriter(ms)) {
-                    if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null) {
+                    if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null && (CurrentInput == null || !CurrentInput.Reset)) {
                         var transform = playerCar.transform;
                         
                         bool isSlipping = false;
