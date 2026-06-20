@@ -6,6 +6,7 @@ import numpy as np
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
 from zeep_env import ZeepkistEnv
 
 class CustomPPO(PPO):
