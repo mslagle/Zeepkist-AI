@@ -8,13 +8,14 @@ import os
 import struct
 
 class ZeepkistEnv(gym.Env):
-    def __init__(self, telemetry_port=9090, input_port=9091, points_port=9092, host='127.0.0.1'):
+    def __init__(self, telemetry_port=9090, input_port=9091, points_port=9092, host='127.0.0.1', use_curriculum=True):
         super(ZeepkistEnv, self).__init__()
 
         self.telemetry_port = telemetry_port
         self.input_port = input_port
         self.points_port = points_port
         self.host = host
+        self.use_curriculum = use_curriculum
 
         # Action Space: [Steering (-1 to 1), Brake (0 to 1), ArmsUp (0 to 1)]
         self.action_space = spaces.Box(
@@ -57,6 +58,7 @@ class ZeepkistEnv(gym.Env):
         
         self.last_ghost_index = 0
         self.max_ghost_index = 0
+        self.global_max_ghost_index = 0
         self.steps_in_episode = 0
         self.stuck_start_time = None
         self.last_steering = 0.0
@@ -64,6 +66,8 @@ class ZeepkistEnv(gym.Env):
         self.last_log_time = time.time()
         
         # Cumulative Time Tracking
+        self.initial_unity_time = None
+        self.current_unity_time = 0.0
         self.start_session_time = time.time()
         self.time_file = "zeepkist_total_time.txt"
         self.accumulated_time = 0.0
@@ -138,6 +142,10 @@ class ZeepkistEnv(gym.Env):
 
             t = {}
             t['Time'] = read_float()
+            if self.initial_unity_time is None:
+                self.initial_unity_time = t['Time']
+            self.current_unity_time = t['Time']
+            
             t['Position'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
             t['Rotation'] = {'x': read_float(), 'y': read_float(), 'z': read_float(), 'w': read_float()}
             t['Velocity'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
@@ -155,6 +163,7 @@ class ZeepkistEnv(gym.Env):
             
             t['GroundNormal'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
             t['CPDir'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
+            t['CPRelPos'] = {'x': read_float(), 'y': read_float(), 'z': read_float()}
             
             t['LevelHash'] = read_string()
             t['ResetReason'] = read_string()
@@ -164,6 +173,7 @@ class ZeepkistEnv(gym.Env):
             if self.current_level_hash != t['LevelHash']:
                 self.current_level_hash = t['LevelHash']
                 self.ghost_frames = None
+                self.global_max_ghost_index = 0
                 
             return True
         except Exception: return False
@@ -193,6 +203,7 @@ class ZeepkistEnv(gym.Env):
     def _get_obs(self):
         t = self.last_telemetry
         if not t or not t.get('IsSpawned', False):
+            self.fallen_off = False
             return np.zeros(110, dtype=np.float32)
 
         car_pos = np.array([t['Position']['x'], t['Position']['y'], t['Position']['z']])
@@ -211,6 +222,7 @@ class ZeepkistEnv(gym.Env):
         lookahead2 = np.zeros(3)
         progress = 0.0
         
+        self.fallen_off = False
         if self.ghost_frames:
             # Find nearest point (with 500-frame forward window to prevent U-turns)
             search_start = self.last_ghost_index
@@ -229,6 +241,7 @@ class ZeepkistEnv(gym.Env):
                 self.last_ghost_index = np.argmin(dists)
 
             gf = self.ghost_frames[self.last_ghost_index]
+            self.fallen_off = (gf['p'][1] - car_pos[1]) > 15.0
             rel_ghost_pos = self._rotate_to_local(gf['p'] - car_pos, car_quat)
             # Relative Rotation (Ghost Quat * Inverse Car Quat)
             rel_ghost_rot = self._relative_quaternion(car_quat, gf['r'])
@@ -236,8 +249,8 @@ class ZeepkistEnv(gym.Env):
             ghost_flags = [1.0 if gf['a'] else 0.0, 1.0 if gf['b'] else 0.0]
             
             # Lookaheads
-            lh1_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 10) # ~0.5s ahead
-            lh2_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 30) # ~1.5s ahead
+            lh1_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 30) # ~1.5s ahead
+            lh2_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 60) # ~3.0s ahead
             lookahead1 = self._rotate_to_local(np.array(self.ghost_frames[lh1_idx]['p']) - car_pos, car_quat)
             lookahead2 = self._rotate_to_local(np.array(self.ghost_frames[lh2_idx]['p']) - car_pos, car_quat)
             progress = self.last_ghost_index / len(self.ghost_frames)
@@ -270,6 +283,11 @@ class ZeepkistEnv(gym.Env):
         
         reward = 0.0
         
+        # 0. CHECKPOINT BONUS (Mandatory for completion)
+        if self.last_telemetry.get('CheckpointReached', False):
+            reward += 500.0
+            print(f"[REWARD] Checkpoint reached! +500")
+
         # 1. PROGRESS REWARD (Primary)
         if self.last_ghost_index > self.max_ghost_index:
             reward += (self.last_ghost_index - self.max_ghost_index) * 5.0
@@ -278,9 +296,17 @@ class ZeepkistEnv(gym.Env):
         # 2. DIRECTIONAL VELOCITY (Secondary)
         reward += vel_local[2] * 0.05
         
-        # 3. PATH ADHERENCE (Capped to prevent domination)
+        # 3. PATH ADHERENCE (Capped to prevent reward scaling explosion)
         dist_to_path = np.linalg.norm(rel_ghost_pos)
         reward -= min(dist_to_path * 0.1, 1.5)
+        
+        # 3b. PACING REWARD (Shaping reward to match path and speed profile, without penalizing over-speed)
+        if self.ghost_frames and self.last_ghost_index < len(self.ghost_frames):
+            gf = self.ghost_frames[self.last_ghost_index]
+            ghost_speed = gf['s']
+            speed_error = max(0.0, ghost_speed - speed)
+            pacing_reward = 0.5 * np.exp(-dist_to_path * 0.2) * np.exp(-speed_error * 0.1)
+            reward += pacing_reward
         
         # 4. MOMENTUM CONSERVATION
         steering = action[0]
@@ -330,7 +356,7 @@ class ZeepkistEnv(gym.Env):
                     layer_mult = 1.0 if layer == 1 else 0.7 
                     proximity_penalty += weight * layer_mult * (4.0 - r)
                     
-        reward -= proximity_penalty * 0.03 # Tuned for 75 rays
+        reward -= proximity_penalty * 0.09 # Tripled from 0.03 for stronger repulsion
 
         return reward
 
@@ -353,6 +379,9 @@ class ZeepkistEnv(gym.Env):
         reward = self._calculate_reward(obs, action)
         self.episode_reward += reward
         
+        if self.last_ghost_index > self.global_max_ghost_index:
+            self.global_max_ghost_index = self.last_ghost_index
+        
         # Stuck Detection
         speed = obs[6]
         terminated = False
@@ -368,13 +397,20 @@ class ZeepkistEnv(gym.Env):
         # Periodic Status Logging (Every 30 seconds)
         now = time.time()
         if now - self.last_log_time > 30.0:
-            total_time = self.accumulated_time + (now - self.start_session_time)
+            session_delta = 0.0
+            if self.initial_unity_time is not None:
+                session_delta = self.current_unity_time - self.initial_unity_time
+            total_time = self.accumulated_time + session_delta
             print(f"[STATUS] Time: {int(total_time)}s | Ep Steps: {self.steps_in_episode} | Ep Reward: {self.episode_reward:.2f}")
             self.last_log_time = now
 
         # Terminal conditions
         if not terminated:
-            if not self.last_telemetry.get('IsSpawned', False):
+            if getattr(self, 'fallen_off', False):
+                print(f"[RESET] Reason: Fell off track (>15m below ghost) | Ep Reward: {self.episode_reward:.2f}")
+                reward -= 100.0
+                terminated = True
+            elif not self.last_telemetry.get('IsSpawned', False):
                 reason = self.last_telemetry.get('ResetReason', 'Unknown')
                 print(f"[RESET] Reason: {reason} | Ep Reward: {self.episode_reward:.2f}")
                 if reason == "Finished": reward += 1000.0
@@ -390,14 +426,23 @@ class ZeepkistEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.steps_in_episode = 0
-        self.last_ghost_index = 0
-        self.max_ghost_index = 0
+        
+        # Sample spawn index using Curriculum Learning
+        spawn_index = 0
+        if self.use_curriculum and self.ghost_frames and getattr(self, 'global_max_ghost_index', 0) > 50:
+            if np.random.rand() < 0.5:
+                max_start = min(len(self.ghost_frames) - 20, int(self.global_max_ghost_index - 30))
+                if max_start > 0:
+                    spawn_index = int(np.random.randint(0, max_start))
+                    
+        self.last_ghost_index = spawn_index
+        self.max_ghost_index = spawn_index
         self.last_steering = 0.0
         self.episode_reward = 0.0
         self.stuck_start_time = None
         
-        print("\n--- NEW RACE STARTING ---")
-        self._send_input(0.0, 0.0, 0.0, reset=True)
+        print(f"\n--- NEW RACE STARTING (Spawn Index: {spawn_index} / Furthest: {self.global_max_ghost_index}) ---")
+        self._send_input(0.0, 0.0, 0.0, reset=True, spawn_index=spawn_index)
         
         # Wait for respawn and ghost (with 30s timeout)
         start_wait = time.time()
@@ -429,7 +474,10 @@ class ZeepkistEnv(gym.Env):
 
     def save_time(self):
         """Persists total cumulative training time to disk."""
-        total = self.accumulated_time + (time.time() - self.start_session_time)
+        session_delta = 0.0
+        if self.initial_unity_time is not None:
+            session_delta = self.current_unity_time - self.initial_unity_time
+        total = self.accumulated_time + session_delta
         try:
             with open(self.time_file, "w") as f:
                 f.write(str(total))
@@ -441,9 +489,14 @@ class ZeepkistEnv(gym.Env):
         self.telemetry_socket.close()
         self.input_socket.close()
 
-    def _send_input(self, steering, brake, arms, reset=False, request_ghost=False):
-        header = struct.pack('<fffBB', float(steering), float(brake), float(arms), 1 if reset else 0, 1 if request_ghost else 0)
-        total_time = self.accumulated_time + (time.time() - self.start_session_time)
+    def _send_input(self, steering, brake, arms, reset=False, request_ghost=False, spawn_index=-1):
+        header = struct.pack('<fffBBi', float(steering), float(brake), float(arms), 1 if reset else 0, 1 if request_ghost else 0, int(spawn_index))
+        
+        session_delta = 0.0
+        if self.initial_unity_time is not None:
+            session_delta = self.current_unity_time - self.initial_unity_time
+            
+        total_time = self.accumulated_time + session_delta
         input_data = {"p": [[0,0,0]]*4, "t": round(total_time, 1)}
         msg = header + json.dumps(input_data).encode('utf-8')
         try: self.input_socket.sendto(msg, (self.host, self.input_port))

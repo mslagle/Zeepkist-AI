@@ -3,7 +3,7 @@ import os
 import time
 import torch
 import numpy as np
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from zeep_env import ZeepkistEnv
@@ -86,9 +86,9 @@ class Logger(object):
     def flush(self):
         self.terminal.flush(); self.log.flush()
 
-from stable_baselines3.common.monitor import Monitor
+USE_CURRICULUM = True # Set to False to disable mid-race restarts (curriculum learning)
 
-def make_env(): return Monitor(ZeepkistEnv())
+def make_env(): return Monitor(ZeepkistEnv(use_curriculum=USE_CURRICULUM))
 
 def train():
     sys.stdout = Logger("zeepkist_training.log")
@@ -114,36 +114,55 @@ def train():
         print("Creating new normalization stats...")
         env = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
-    # Standardized hyperparameters for stability
+    ALGO = "SAC" # Change to "PPO" to train with PPO
+
+    # Standardized PPO hyperparameters for stability
     target_n_steps = 16384 # Approx 3-4 minutes of driving
     target_batch_size = 128
 
     # 2. Define the model
     model = None
     if os.path.exists(model_path + ".zip"):
-        print("Loading existing model...")
+        print(f"Loading existing {ALGO} model...")
         try:
-            model = CustomPPO.load(model_path, env=env, tensorboard_log="../zeepkist_logs")
-            model.n_steps = target_n_steps
-            model.batch_size = target_batch_size
-            # Rebuild buffer to match new observation space and size
-            from stable_baselines3.common.buffers import RolloutBuffer
-            model.rollout_buffer = RolloutBuffer(model.n_steps, model.observation_space, model.action_space, device=model.device, n_envs=model.n_envs)
-            print(f"Model loaded. Buffer resized to {model.n_steps}")
+            if ALGO == "SAC":
+                model = SAC.load(model_path, env=env, tensorboard_log="../zeepkist_logs")
+            else:
+                model = CustomPPO.load(model_path, env=env, tensorboard_log="../zeepkist_logs")
+                model.n_steps = target_n_steps
+                model.batch_size = target_batch_size
+                # Rebuild buffer to match new observation space and size
+                from stable_baselines3.common.buffers import RolloutBuffer
+                model.rollout_buffer = RolloutBuffer(model.n_steps, model.observation_space, model.action_space, device=model.device, n_envs=model.n_envs)
+            print(f"Model loaded successfully.")
         except Exception as e:
             print(f"Model load failed ({e}), starting fresh.")
             os.rename(model_path + ".zip", f"{model_path}_old_{int(time.time())}.zip")
 
     if model is None:
-        print("Creating fresh model for 48-dim physics space...")
-        model = CustomPPO(
-            "MlpPolicy", env, verbose=1,
-            learning_rate=3e-4, n_steps=target_n_steps, batch_size=target_batch_size,
-            n_epochs=10, gamma=0.99, gae_lambda=0.95, ent_coef=0.01,
-            tensorboard_log="../zeepkist_logs"
-        )
+        if ALGO == "SAC":
+            print("Creating fresh SAC model...")
+            model = SAC(
+                "MlpPolicy", env, verbose=1,
+                learning_rate=3e-4,
+                buffer_size=100_000,
+                learning_starts=1000,
+                batch_size=256,
+                tau=0.005,
+                gamma=0.99,
+                ent_coef="auto",
+                tensorboard_log="../zeepkist_logs"
+            )
+        else:
+            print("Creating fresh PPO model...")
+            model = CustomPPO(
+                "MlpPolicy", env, verbose=1,
+                learning_rate=3e-4, n_steps=target_n_steps, batch_size=target_batch_size,
+                n_epochs=10, gamma=0.99, gae_lambda=0.95, ent_coef=0.01,
+                tensorboard_log="../zeepkist_logs"
+            )
 
-    checkpoint_callback = CheckpointCallback(save_freq=SAVE_FREQ, save_path="./checkpoints/", name_prefix="zeep_physics")
+    checkpoint_callback = CheckpointCallback(save_freq=SAVE_FREQ, save_path="./checkpoints/", name_prefix=f"zeep_{ALGO.lower()}")
 
     # 4. Start Learning
     try:

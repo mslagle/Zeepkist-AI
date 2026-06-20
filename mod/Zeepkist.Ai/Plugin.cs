@@ -9,6 +9,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 using ZeepSDK.Racing;
@@ -32,6 +33,10 @@ namespace Zeepkist.Ai
         public static ConfigEntry<int> TelemetryPort { get; private set; }
         public static ConfigEntry<int> InputPort { get; private set; }
         public static ConfigEntry<int> PointsTcpPort { get; private set; }
+        public static ConfigEntry<bool> ShowEyesightLines { get; private set; }
+        public static ConfigEntry<bool> ShowCpHomingLine { get; private set; }
+        public static ConfigEntry<float> EyesightLineWidth { get; private set; }
+        public static ConfigEntry<float> CpHomingLineWidth { get; private set; }
 
         private static UdpClient telemetryClient;
         private static IPEndPoint telemetryEndPoint;
@@ -47,13 +52,18 @@ namespace Zeepkist.Ai
         private static TargetVisualizer targetVisualizer = null;
         private static string lastResetReason = "None";
         private static bool checkpointReached = false;
+        private static CheckpointHomingVisualizer homingVisualizer = null;
 
         private static GtrClient.GtrClient gtrClient;
         private static List<GhostFrame> cachedFrames = null;
         private static string cachedHash = "";
-        private static bool isSendingPoints = false;
+        private static List<BlockTriggerFinishOrCheckpoint> currentCheckpoints = new List<BlockTriggerFinishOrCheckpoint>();
+        private static BlockTriggerFinishOrCheckpoint currentFinish = null;
+        private static int nextCheckpointIndex = 0;
+        private static int pendingSpawnIndex = -1;
         private static float[][] latestTargetPositions = null;
         private static readonly object targetLock = new object();
+        private static BepInEx.Logging.ManualLogSource staticLogger;
 
         private static bool ghostLoaded = false;
         private static bool ghostReady = false;
@@ -64,6 +74,7 @@ namespace Zeepkist.Ai
 
         private void Awake()
         {
+            staticLogger = Logger;
             Logger.LogInfo("[AI_DEBUG] === Plugin.Awake() STARTING ===");
             harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
             harmony.PatchAll();
@@ -75,11 +86,20 @@ namespace Zeepkist.Ai
             InputPort = Config.Bind<int>("Network", "Input Port", 9091);
             PointsTcpPort = Config.Bind<int>("Network", "Ghost Points TCP Port", 9092);
 
+            ShowEyesightLines = Config.Bind<bool>("Visuals", "Show Eyesight Lines", true);
+            ShowCpHomingLine = Config.Bind<bool>("Visuals", "Show CP Homing Line", true);
+            EyesightLineWidth = Config.Bind<float>("Visuals", "Eyesight Line Width", 0.05f);
+            CpHomingLineWidth = Config.Bind<float>("Visuals", "CP Homing Line Width", 0.20f);
+
             gtrClient = new GtrClient.GtrClient(Logger);
 
-            SetupNetwork();
+            RacingApi.PassedCheckpoint += (time) => {
+                checkpointReached = true;
+            };
 
             RacingApi.PlayerSpawned += () => {
+                nextCheckpointIndex = 0;
+                InitializeCheckpoints();
                 if (visualizer == null) {
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
                     visualizer = vizObj.AddComponent<GhostVisualizer>();
@@ -92,8 +112,20 @@ namespace Zeepkist.Ai
                     GameObject targetObj = new GameObject("AI_TargetVisualizer");
                     targetVisualizer = targetObj.AddComponent<TargetVisualizer>();
                 }
+                if (homingVisualizer == null) {
+                    GameObject homingObj = new GameObject("AI_CheckpointHomingVisualizer");
+                    homingVisualizer = homingObj.AddComponent<CheckpointHomingVisualizer>();
+                }
 
                 playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
+                if (pendingSpawnIndex >= 0) {
+                    int spawnIdx = pendingSpawnIndex;
+                    pendingSpawnIndex = -1;
+                    UnityMainThreadDispatcher.Instance().Enqueue(() => {
+                        TeleportCar(playerCar, spawnIdx);
+                        UpdateNextCheckpointIndex();
+                    });
+                }
                 string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
                 lastResetReason = "None";
                 
@@ -116,8 +148,8 @@ namespace Zeepkist.Ai
             RacingApi.Crashed += (reason) => { playerCar = null; lastResetReason = "Crashed: " + reason; };
             RacingApi.CrossedFinishLine += (time) => { playerCar = null; lastResetReason = "Finished"; };
             RacingApi.WheelBroken += () => { playerCar = null; lastResetReason = "Wheel Broken"; };
-            RacingApi.PassedCheckpoint += (time) => { checkpointReached = true; };
 
+            SetupNetwork();
             Logger.LogInfo($"[AI_DEBUG] Plugin fully initialized!");
         }
 
@@ -139,11 +171,12 @@ namespace Zeepkist.Ai
                 cachedHash = hash;
                 Logger.LogInfo($"[AI_DEBUG] Successfully processed {frames.Count} points. Updating visualizer.");
 
-                if (visualizer != null && ShowGhostPath.Value) {
-                    UnityMainThreadDispatcher.Instance().Enqueue(() => { 
+                UnityMainThreadDispatcher.Instance().Enqueue(() => { 
+                    if (visualizer != null && ShowGhostPath.Value) {
                         visualizer.UpdateLine(frames.Select(f => f.Position).ToList()); 
-                    });
-                }
+                    }
+                    InitializeCheckpoints();
+                });
                 PrepareGhostBinary(frames, hash);
                 Logger.LogInfo("[AI_DEBUG] ghostReady is now TRUE.");
             } catch (Exception ex) {
@@ -161,7 +194,11 @@ namespace Zeepkist.Ai
                 inputServer = new UdpClient(InputPort.Value);
                 inputServer.Client.ReceiveBufferSize = 65536;
                 inputEndPoint = new IPEndPoint(IPAddress.Any, InputPort.Value);
-                inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null);
+                
+                // Start dedicated background thread for receiving inputs
+                Thread receiveThread = new Thread(InputReceiverLoop);
+                receiveThread.IsBackground = true;
+                receiveThread.Start();
 
                 pointsTcpListener = new TcpListener(IPAddress.Any, PointsTcpPort.Value);
                 pointsTcpListener.Start();
@@ -191,37 +228,79 @@ namespace Zeepkist.Ai
             } catch (Exception ex) { Logger.LogError($"AI Network Setup Error: {ex.Message}"); }
         }
 
-        private void OnReceiveInput(IAsyncResult res)
+        private static void InputReceiverLoop()
         {
-            try {
-                byte[] bytes = inputServer.EndReceive(res, ref inputEndPoint);
-                if (bytes.Length >= 14) {
-                    lastInputTime = DateTime.Now;
-                    using (MemoryStream ms = new MemoryStream(bytes))
-                    using (BinaryReader reader = new BinaryReader(ms)) {
-                        CurrentInput.Steering = reader.ReadSingle();
-                        CurrentInput.Brake = reader.ReadSingle();
-                        CurrentInput.ArmsUp = reader.ReadSingle();
-                        CurrentInput.Reset = reader.ReadBoolean();
-                        CurrentInput.RequestGhost = reader.ReadBoolean();
-                        
-                        inputPacketCount++;
-                        if (inputPacketCount % 500 == 0) {
-                            Logger.LogInfo($"[AI_DEBUG] Recv Input: Steer={CurrentInput.Steering:F2}, Brake={CurrentInput.Brake:F2}, Arms={CurrentInput.ArmsUp:F2}");
-                        }
+            IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, InputPort.Value);
+            staticLogger.LogInfo($"[AI_DEBUG] Dedicated Input Receiver Thread started on port {InputPort.Value}");
+            
+            while (true)
+            {
+                try
+                {
+                    if (inputServer == null)
+                    {
+                        Thread.Sleep(100);
+                        continue;
+                    }
+                    
+                    byte[] bytes = inputServer.Receive(ref remoteEP);
+                    if (bytes != null && bytes.Length >= 18)
+                    {
+                        lastInputTime = DateTime.Now;
+                        using (MemoryStream ms = new MemoryStream(bytes))
+                        using (BinaryReader reader = new BinaryReader(ms))
+                        {
+                            float steer = reader.ReadSingle();
+                            float brake = reader.ReadSingle();
+                            float arms = reader.ReadSingle();
+                            bool reset = reader.ReadBoolean();
+                            bool reqGhost = reader.ReadBoolean();
+                            int spawnIdx = reader.ReadInt32();
 
-                        if (bytes.Length > 14) {
-                            string json = Encoding.UTF8.GetString(bytes, 14, bytes.Length - 14);
-                            var data = JsonConvert.DeserializeObject<JsonInputData>(json);
-                            if (data != null) {
-                                lock (targetLock) { latestTargetPositions = data.p; }
-                                CurrentInput.TrainingTime = data.t;
+                            CurrentInput.Steering = steer;
+                            CurrentInput.Brake = brake;
+                            CurrentInput.ArmsUp = arms;
+                            CurrentInput.Reset = reset;
+                            CurrentInput.RequestGhost = reqGhost;
+                            CurrentInput.SpawnIndex = spawnIdx;
+                            
+                            inputPacketCount++;
+                            if (inputPacketCount % 500 == 0)
+                            {
+                                staticLogger.LogInfo($"[AI_DEBUG] Recv Input: Steer={steer:F2}, Brake={brake:F2}, Arms={arms:F2}, SpawnIndex={spawnIdx}");
+                            }
+
+                            if (bytes.Length > 18)
+                            {
+                                string json = Encoding.UTF8.GetString(bytes, 18, bytes.Length - 18);
+                                var data = JsonConvert.DeserializeObject<JsonInputData>(json);
+                                if (data != null)
+                                {
+                                    lock (targetLock) { latestTargetPositions = data.p; }
+                                    CurrentInput.TrainingTime = data.t;
+                                }
                             }
                         }
                     }
                 }
-            } catch { }
-            try { inputServer.BeginReceive(new AsyncCallback(OnReceiveInput), null); } catch { }
+                catch (SocketException ex)
+                {
+                    if (ex.SocketErrorCode == SocketError.Interrupted || ex.SocketErrorCode == SocketError.ConnectionReset)
+                    {
+                        // UDP port unreachable/closed, ignore
+                    }
+                    else
+                    {
+                        staticLogger.LogError($"[AI_DEBUG] Input Socket Exception: {ex.Message}");
+                        Thread.Sleep(100);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    staticLogger.LogError($"[AI_DEBUG] Input Receiver Thread error: {ex.Message}");
+                    Thread.Sleep(100);
+                }
+            }
         }
 
         private void Update()
@@ -247,18 +326,6 @@ namespace Zeepkist.Ai
             }
         }
 
-        private void OnGUI()
-        {
-            if (EnableAi.Value && CurrentInput != null) {
-                TimeSpan t = TimeSpan.FromSeconds(CurrentInput.TrainingTime);
-                string timeStr = string.Format("{0:D2}:{1:D2}:{2:D2}", (int)t.TotalHours, t.Minutes, t.Seconds);
-                GUIStyle style = new GUIStyle { fontSize = 72, fontStyle = FontStyle.Bold };
-                style.normal.textColor = Color.black;
-                GUI.Label(new Rect(22, 22, 1000, 100), $"Total Training Time: {timeStr}", style);
-                style.normal.textColor = Color.white;
-                GUI.Label(new Rect(20, 20, 1000, 100), $"Total Training Time: {timeStr}", style);
-            }
-        }
 
         private void FixedUpdate()
         {
@@ -276,10 +343,12 @@ namespace Zeepkist.Ai
 
             if (CurrentInput != null && CurrentInput.Reset && !isPaused) {
                 if (PlayerManager.Instance?.currentMaster != null) {
+                    pendingSpawnIndex = CurrentInput.SpawnIndex;
                     PlayerManager.Instance.currentMaster.RestartLevel();
                     CurrentInput.Reset = false; playerCar = null;
                 }
             }
+            UpdateNextCheckpointIndex();
             SendTelemetry();
         }
 
@@ -326,17 +395,29 @@ namespace Zeepkist.Ai
                             groundNormal = groundHit.normal;
                         }
 
-                        // Checkpoint Direction (TODO: Find correct property for handler)
+                        // Checkpoint Direction and Relative Position
                         Vector3 nextCpDir = transform.forward;
-                        /*
-                        var setups = PlayerManager.Instance?.currentMaster?.carSetups;
-                        if (setups != null && setups.Count > 0 && setups[0].cc != null) {
-                            var handler = setups[0].cc.checkpointHandler;
-                            if (handler != null && handler.nextCheckpoint != null) {
-                                nextCpDir = (handler.nextCheckpoint.transform.position - transform.position).normalized;
+                        Vector3 relCpPos = Vector3.zero;
+                        
+                        Vector3 targetPos = Vector3.zero;
+                        bool hasTarget = false;
+
+                        if (nextCheckpointIndex < currentCheckpoints.Count && currentCheckpoints[nextCheckpointIndex] != null) {
+                            targetPos = currentCheckpoints[nextCheckpointIndex].transform.position;
+                            hasTarget = true;
+                        } else if (currentFinish != null) {
+                            targetPos = currentFinish.transform.position;
+                            hasTarget = true;
+                        }
+
+                        if (hasTarget) {
+                            nextCpDir = (targetPos - transform.position).normalized;
+                            relCpPos = transform.InverseTransformPoint(targetPos);
+                            
+                            if (homingVisualizer != null) {
+                                homingVisualizer.UpdateHoming(transform.position + transform.up * 1.0f, targetPos);
                             }
                         }
-                        */
 
                         writer.Write(Time.time);
                         writer.Write(transform.position.x); writer.Write(transform.position.y); writer.Write(transform.position.z);
@@ -353,6 +434,8 @@ namespace Zeepkist.Ai
                         // New Physics Data
                         writer.Write(groundNormal.x); writer.Write(groundNormal.y); writer.Write(groundNormal.z);
                         writer.Write(nextCpDir.x); writer.Write(nextCpDir.y); writer.Write(nextCpDir.z);
+                        // Add relative position for the brain
+                        writer.Write(relCpPos.x); writer.Write(relCpPos.y); writer.Write(relCpPos.z);
 
                         writer.Write(currentLevelHash); writer.Write(lastResetReason);
                         checkpointReached = false;
@@ -370,10 +453,13 @@ namespace Zeepkist.Ai
                         writer.Write(1.0f);
                         writer.Write(0f); writer.Write(1f); writer.Write(0f); // Ground Normal Up
                         writer.Write(0f); writer.Write(0f); writer.Write(1f); // CP Forward
+                        writer.Write(0f); writer.Write(0f); writer.Write(0f); // CP Rel Pos
                         writer.Write(currentLevelHash); writer.Write(lastResetReason);
                     }
                     byte[] bytes = ms.ToArray();
-                    telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint);
+                    Task.Run(() => {
+                        try { telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint); } catch { }
+                    });
                 }
             } catch { }
         }
@@ -381,20 +467,111 @@ namespace Zeepkist.Ai
         private float GetSphereCast(Vector3 direction, float maxDist, int index = -1)
         {
             if (playerCar == null) return maxDist;
-            Vector3 origin = playerCar.transform.position + playerCar.transform.up * 0.5f;
+            Vector3 origin = playerCar.transform.position + playerCar.transform.up * 1.0f;
             RaycastHit hit;
+            float startOffset = 2.0f;
             float dist = maxDist;
             bool isObstacle = false;
             
             // Ignore the player car layer
             int layerMask = ~(1 << playerCar.gameObject.layer);
             
-            if (Physics.SphereCast(origin, 0.75f, direction, out hit, maxDist, layerMask)) {
-                dist = hit.distance;
+            Vector3 castOrigin = origin + direction * startOffset;
+            if (Physics.SphereCast(castOrigin, 0.75f, direction, out hit, maxDist - startOffset, layerMask)) {
+                dist = startOffset + hit.distance;
                 if (Mathf.Abs(hit.normal.y) < 0.8f) { isObstacle = true; }
             }
             if (rayVisualizer != null && index >= 0) rayVisualizer.UpdateRay(index, origin, origin + direction * dist, isObstacle);
             return dist;
+        }
+
+        private static int GetClosestGhostFrameIndex(Vector3 pos)
+        {
+            if (cachedFrames == null || cachedFrames.Count == 0) return 0;
+            int closestIdx = 0;
+            float minDist = float.MaxValue;
+            for (int i = 0; i < cachedFrames.Count; i++) {
+                float dist = Vector3.Distance(cachedFrames[i].Position, pos);
+                if (dist < minDist) {
+                    minDist = dist;
+                    closestIdx = i;
+                }
+            }
+            return closestIdx;
+        }
+
+        private static void InitializeCheckpoints()
+        {
+            try {
+                currentCheckpoints.Clear();
+                currentFinish = null;
+
+                var allTriggers = UnityEngine.Object.FindObjectsOfType<BlockTriggerFinishOrCheckpoint>();
+                if (allTriggers == null || allTriggers.Length == 0) {
+                    return;
+                }
+
+                List<BlockTriggerFinishOrCheckpoint> cps = new List<BlockTriggerFinishOrCheckpoint>();
+                foreach (var trigger in allTriggers) {
+                    if (trigger == null) continue;
+                    if (trigger.isFinish) {
+                        currentFinish = trigger;
+                    } else {
+                        cps.Add(trigger);
+                    }
+                }
+
+                if (cachedFrames != null && cachedFrames.Count > 0) {
+                    currentCheckpoints = cps.OrderBy(cp => GetClosestGhostFrameIndex(cp.transform.position)).ToList();
+                } else {
+                    currentCheckpoints = cps;
+                }
+            } catch { }
+        }
+
+        private static void TeleportCar(New_ControlCar car, int index)
+        {
+            if (car == null || cachedFrames == null || cachedFrames.Count == 0 || index < 0 || index >= cachedFrames.Count) return;
+            try {
+                var frame = cachedFrames[index];
+                
+                Vector3 dir = car.transform.forward;
+                if (index < cachedFrames.Count - 1) {
+                    dir = (cachedFrames[index + 1].Position - frame.Position).normalized;
+                } else if (index > 0) {
+                    dir = (frame.Position - cachedFrames[index - 1].Position).normalized;
+                }
+                
+                car.rb.isKinematic = true;
+                car.transform.position = frame.Position;
+                car.transform.rotation = frame.Rotation;
+                car.rb.isKinematic = false;
+                
+                car.rb.velocity = dir * frame.Speed;
+                car.rb.angularVelocity = Vector3.zero;
+                
+                staticLogger.LogInfo($"[AI_DEBUG] Teleported car to index {index}. Position={frame.Position}, Speed={frame.Speed}");
+            } catch (Exception ex) {
+                staticLogger.LogError($"[AI_DEBUG] Error in TeleportCar: {ex.Message}");
+            }
+        }
+
+        private static void UpdateNextCheckpointIndex()
+        {
+            if (playerCar == null || currentCheckpoints == null || currentCheckpoints.Count == 0) return;
+            try {
+                int carGhostIndex = GetClosestGhostFrameIndex(playerCar.transform.position);
+                int nextCp = 0;
+                for (int i = 0; i < currentCheckpoints.Count; i++) {
+                    if (currentCheckpoints[i] != null) {
+                        int cpGhostIndex = GetClosestGhostFrameIndex(currentCheckpoints[i].transform.position);
+                        if (cpGhostIndex <= carGhostIndex) {
+                            nextCp = i + 1;
+                        }
+                    }
+                }
+                nextCheckpointIndex = nextCp;
+            } catch { }
         }
 
         public void PrepareGhostBinary(List<GhostFrame> frames, string levelHash)
@@ -461,6 +638,8 @@ namespace Zeepkist.Ai
 
     public class RaycastVisualizer : MonoBehaviour {
         private LineRenderer[] lines;
+        private static int debugLogCounter = 0;
+
         private void Awake() {
             lines = new LineRenderer[75];
             for (int i = 0; i < 75; i++) {
@@ -469,26 +648,40 @@ namespace Zeepkist.Ai
                 lines[i] = obj.AddComponent<LineRenderer>();
                 lines[i].useWorldSpace = true;
                 lines[i].positionCount = 2;
-                lines[i].startWidth = 0.15f; lines[i].endWidth = 0.15f;
                 lines[i].material = new Material(Shader.Find("Sprites/Default"));
             }
         }
         public void UpdateRay(int idx, Vector3 start, Vector3 end, bool hit) {
             if (lines == null || idx < 0 || idx >= lines.Length || lines[idx] == null) return;
-            lines[idx].enabled = true;
+            lines[idx].enabled = Plugin.ShowEyesightLines.Value;
+            if (!lines[idx].enabled) return;
+            
             lines[idx].SetPositions(new Vector3[] { start, end });
             Color c;
-            if (idx < 25) c = Color.blue;
-            else if (idx < 50) c = Color.green;
+            if (idx < 25) c = Color.cyan;
+            else if (idx < 50) c = Color.yellow;
             else c = Color.magenta;
             
             if (hit) c = Color.red;
-            c.a = 0.8f;
             lines[idx].startColor = c; lines[idx].endColor = c;
+
+            if (idx == 0) {
+                debugLogCounter++;
+                if (debugLogCounter % 300 == 0) {
+                    UnityEngine.Debug.Log($"[AI_DEBUG] Ray 0: Start={start}, End={end}, Length={Vector3.Distance(start, end):F2}, Hit={hit}, Enabled={lines[idx].enabled}");
+                }
+            }
         }
         private void Update() { 
-            bool show = Plugin.playerCar != null && Plugin.EnableAi.Value;
-            foreach (var l in lines) if (l != null) l.enabled = show; 
+            bool show = Plugin.playerCar != null && Plugin.EnableAi.Value && Plugin.ShowEyesightLines.Value;
+            float width = Plugin.EyesightLineWidth.Value;
+            foreach (var l in lines) {
+                if (l != null) {
+                    l.enabled = show;
+                    l.startWidth = width;
+                    l.endWidth = width;
+                }
+            }
         }
     }
 
@@ -519,8 +712,32 @@ namespace Zeepkist.Ai
         private void Update() { if (Plugin.playerCar == null) foreach (var m in markers) if (m != null) m.SetActive(false); }
     }
 
+    public class CheckpointHomingVisualizer : MonoBehaviour {
+        private LineRenderer line;
+        private void Awake() {
+            line = gameObject.AddComponent<LineRenderer>();
+            line.useWorldSpace = true;
+            line.material = new Material(Shader.Find("Sprites/Default"));
+            line.startColor = Color.yellow; line.endColor = Color.yellow;
+            line.positionCount = 2;
+        }
+        public void UpdateHoming(Vector3 start, Vector3 end) {
+            line.enabled = Plugin.ShowCpHomingLine.Value;
+            if (!line.enabled) return;
+            line.SetPositions(new Vector3[] { start, end });
+        }
+        private void Update() { 
+            bool show = Plugin.playerCar != null && Plugin.EnableAi.Value && Plugin.ShowCpHomingLine.Value;
+            line.enabled = show; 
+            float width = Plugin.CpHomingLineWidth.Value;
+            line.startWidth = width;
+            line.endWidth = width;
+        }
+    }
+
     public class AiInput {
         public float Steering; public float Brake; public float ArmsUp; public bool Reset; public bool RequestGhost;
+        public int SpawnIndex;
         public float[][] TargetPositions; public float TrainingTime;
     }
 }
