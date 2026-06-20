@@ -86,7 +86,7 @@ class Logger(object):
     def flush(self):
         self.terminal.flush(); self.log.flush()
 
-USE_CURRICULUM = True # Set to False to disable mid-race restarts (curriculum learning)
+USE_CURRICULUM = False # Set to False to disable mid-race restarts (curriculum learning)
 
 def make_env(): return Monitor(ZeepkistEnv(use_curriculum=USE_CURRICULUM))
 
