@@ -43,7 +43,7 @@ class ZeepkistEnv(gym.Env):
         # 45: Progress (0.0 to 1.0)
         # 46: Ghost Loaded (Binary)
         # 47: Groundedness (Derived from rays/friction)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(110,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(35,), dtype=np.float32)
 
         # Network setup
         self.telemetry_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -156,7 +156,6 @@ class ZeepkistEnv(gym.Env):
             t['GhostReady'] = read_bool()
             t['CheckpointReached'] = read_bool()
 
-            t['Rays'] = [read_float() for _ in range(75)]
             t['IsSlipping'] = read_bool()
             t['IsGrounded'] = read_bool()
             t['SurfaceFriction'] = read_float()
@@ -263,7 +262,6 @@ class ZeepkistEnv(gym.Env):
             vel_local, ang_vel_local, [t['Speed']],
             rel_ghost_pos, rel_ghost_rot, [ghost_speed], ghost_flags,
             ground_normal_local, cp_dir_local,
-            t['Rays'],
             lookahead1, lookahead2,
             [self.last_steering], [1.0 if t['IsSlipping'] else 0.0], [t['SurfaceFriction']],
             [progress], [1.0 if self.ghost_frames else 0.0],
@@ -274,11 +272,11 @@ class ZeepkistEnv(gym.Env):
 
     def _calculate_reward(self, obs, action):
         # 0-2: VelLocal, 7-9: RelGhostPos, 17-19: GroundNormal, 20-22: CPDir
-        # Rays: 23-97 (75 rays)
+        # Since we removed Rays (75 values), the new index of IsGrounded is 34.
         vel_local = obs[0:3]
         speed = obs[6]
         rel_ghost_pos = obs[7:10]
-        is_grounded = obs[109] > 0.5
+        is_grounded = obs[34] > 0.5
         ghost_is_braking = obs[16] > 0.5
         
         reward = 0.0
@@ -293,22 +291,15 @@ class ZeepkistEnv(gym.Env):
             reward += (self.last_ghost_index - self.max_ghost_index) * 5.0
             self.max_ghost_index = self.last_ghost_index
         
-        # 2. DIRECTIONAL VELOCITY (Secondary)
-        reward += vel_local[2] * 0.05
-        
-        # 3. PATH ADHERENCE (Capped to prevent reward scaling explosion)
+        # 2. SPEED ON PATH (Primary continuous reward: speed in direction of path * path adherence)
         dist_to_path = np.linalg.norm(rel_ghost_pos)
-        reward -= min(dist_to_path * 0.1, 1.5)
+        speed_on_path = vel_local[2] * np.exp(-dist_to_path * 0.3)
+        reward += speed_on_path * 0.5
         
-        # 3b. PACING REWARD (Shaping reward to match path and speed profile, without penalizing over-speed)
-        if self.ghost_frames and self.last_ghost_index < len(self.ghost_frames):
-            gf = self.ghost_frames[self.last_ghost_index]
-            ghost_speed = gf['s']
-            speed_error = max(0.0, ghost_speed - speed)
-            pacing_reward = 0.5 * np.exp(-dist_to_path * 0.2) * np.exp(-speed_error * 0.1)
-            reward += pacing_reward
+        # 3. PATH DISTANCE PENALTY (Guides the agent back if it wanders off)
+        reward -= dist_to_path * 0.2
         
-        # 4. MOMENTUM CONSERVATION
+        # 4. MOMENTUM CONSERVATION (Smooth steering)
         steering = action[0]
         reward -= abs(steering) * (speed / 100.0) * 0.05
         
@@ -317,22 +308,21 @@ class ZeepkistEnv(gym.Env):
         reward -= (steering_change ** 2) * 2.0
         self.last_steering = steering
         
-        # 6. LANDING / ORIENTATION
+        # 6. LANDING / ORIENTATION ALIGNMENT
         ground_normal = obs[17:20]
         car_up = np.array([0, 1, 0])
         alignment = np.dot(ground_normal, car_up)
         reward += alignment * 0.1
 
-        # 7. BRAKING PENALTY (Continuous & Surgical)
+        # 7. BRAKING PENALTY
         brake_input = action[1]
         if brake_input > 0.01:
             if is_grounded:
                 if not ghost_is_braking:
-                    reward -= brake_input * 5.0  # Heavily penalize braking on the ground
+                    reward -= brake_input * 5.0
                 else:
-                    reward -= brake_input * 0.1  # Very light penalty if ghost is braking
+                    reward -= brake_input * 0.1
             else:
-                # In the air: penalize braking only if the car is stable
                 ang_vel_mag = np.linalg.norm(obs[3:6])
                 spin_factor = max(0.0, 1.0 - ang_vel_mag / 1.0)
                 reward -= brake_input * spin_factor * 1.0
@@ -341,22 +331,6 @@ class ZeepkistEnv(gym.Env):
         if not is_grounded:
             ang_vel_mag = np.linalg.norm(obs[3:6])
             reward -= ang_vel_mag * 0.05
-
-        # 8. OBSTACLE AVOIDANCE (Multi-Layer)
-        # Use 75 SphereCasts (obs 23-97) to penalize proximity to walls/obstacles
-        rays = obs[23:98]
-        proximity_penalty = 0.0
-        for layer in range(3):
-            layer_rays = rays[layer*25 : (layer+1)*25]
-            for i, r in enumerate(layer_rays):
-                if r < 4.0:
-                    # Front-facing rays in each layer (indices 8-16) have higher weight
-                    weight = 1.0 if (8 <= i <= 16) else 0.5
-                    # Higher layers have slightly lower penalty (overhangs are less scary than floor rocks)
-                    layer_mult = 1.0 if layer == 1 else 0.7 
-                    proximity_penalty += weight * layer_mult * (4.0 - r)
-                    
-        reward -= proximity_penalty * 0.09 # Tripled from 0.03 for stronger repulsion
 
         return reward
 
@@ -428,35 +402,43 @@ class ZeepkistEnv(gym.Env):
         self.steps_in_episode = 0
         
         # Sample spawn index using Curriculum Learning
-        spawn_index = 0
+        spawn_index = -1
         if self.use_curriculum and self.ghost_frames and getattr(self, 'global_max_ghost_index', 0) > 50:
             if np.random.rand() < 0.5:
                 max_start = min(len(self.ghost_frames) - 20, int(self.global_max_ghost_index - 30))
                 if max_start > 0:
-                    spawn_index = int(np.random.randint(0, max_start))
+                    spawn_index = int(np.random.randint(1, max_start))
                     
-        self.last_ghost_index = spawn_index
-        self.max_ghost_index = spawn_index
+        self.last_ghost_index = max(0, spawn_index)
+        self.max_ghost_index = max(0, spawn_index)
         self.last_steering = 0.0
         self.episode_reward = 0.0
         self.stuck_start_time = None
         
-        print(f"\n--- NEW RACE STARTING (Spawn Index: {spawn_index} / Furthest: {self.global_max_ghost_index}) ---")
+        print(f"\n--- NEW RACE STARTING (Spawn Index: {max(0, spawn_index)} / Furthest: {self.global_max_ghost_index}) ---")
         self._send_input(0.0, 0.0, 0.0, reset=True, spawn_index=spawn_index)
         
-        # Wait for respawn and ghost (with 30s timeout)
-        start_wait = time.time()
-        while time.time() - start_wait < 30.0:
+        # 1. Wait for IsSpawned to become False (ensure reset processed)
+        start_wait_false = time.time()
+        while time.time() - start_wait_false < 3.0:
+            if self._receive_telemetry():
+                if not self.last_telemetry.get('IsSpawned', False):
+                    break
+            time.sleep(0.05)
+
+        # 2. Wait for IsSpawned to become True (ensure car spawned)
+        start_wait_true = time.time()
+        while time.time() - start_wait_true < 30.0:
             try:
                 if self._receive_telemetry():
-                    if self.last_telemetry['IsSpawned']:
+                    if self.last_telemetry.get('IsSpawned', False):
                         level = self.last_telemetry['LevelHash']
                         if self.ghost_frames is None:
                             self._send_input(0.0, 0.0, 0.0, request_ghost=True)
                             if self._receive_points_from_mod(level):
                                 break
                         else: break
-                time.sleep(0.1)
+                time.sleep(0.05)
             except KeyboardInterrupt:
                 print("\nReset interrupted by user.")
                 raise

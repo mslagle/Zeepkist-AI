@@ -33,9 +33,7 @@ namespace Zeepkist.Ai
         public static ConfigEntry<int> TelemetryPort { get; private set; }
         public static ConfigEntry<int> InputPort { get; private set; }
         public static ConfigEntry<int> PointsTcpPort { get; private set; }
-        public static ConfigEntry<bool> ShowEyesightLines { get; private set; }
         public static ConfigEntry<bool> ShowCpHomingLine { get; private set; }
-        public static ConfigEntry<float> EyesightLineWidth { get; private set; }
         public static ConfigEntry<float> CpHomingLineWidth { get; private set; }
 
         private static UdpClient telemetryClient;
@@ -48,11 +46,11 @@ namespace Zeepkist.Ai
         public static New_ControlCar playerCar = null;
         private static string currentLevelHash = "Unknown";
         private static GhostVisualizer visualizer = null;
-        private static RaycastVisualizer rayVisualizer = null;
         private static TargetVisualizer targetVisualizer = null;
         private static string lastResetReason = "None";
         private static bool checkpointReached = false;
         private static CheckpointHomingVisualizer homingVisualizer = null;
+        private static bool isRoundActive = false;
 
         private static GtrClient.GtrClient gtrClient;
         private static List<GhostFrame> cachedFrames = null;
@@ -86,9 +84,7 @@ namespace Zeepkist.Ai
             InputPort = Config.Bind<int>("Network", "Input Port", 9091);
             PointsTcpPort = Config.Bind<int>("Network", "Ghost Points TCP Port", 9092);
 
-            ShowEyesightLines = Config.Bind<bool>("Visuals", "Show Eyesight Lines", true);
             ShowCpHomingLine = Config.Bind<bool>("Visuals", "Show CP Homing Line", true);
-            EyesightLineWidth = Config.Bind<float>("Visuals", "Eyesight Line Width", 0.05f);
             CpHomingLineWidth = Config.Bind<float>("Visuals", "CP Homing Line Width", 0.20f);
 
             gtrClient = new GtrClient.GtrClient(Logger);
@@ -98,15 +94,12 @@ namespace Zeepkist.Ai
             };
 
             RacingApi.PlayerSpawned += () => {
+                isRoundActive = true;
                 nextCheckpointIndex = 0;
                 InitializeCheckpoints();
                 if (visualizer == null) {
                     GameObject vizObj = new GameObject("AI_GhostVisualizer");
                     visualizer = vizObj.AddComponent<GhostVisualizer>();
-                }
-                if (rayVisualizer == null) {
-                    GameObject rayObj = new GameObject("AI_RayVisualizer");
-                    rayVisualizer = rayObj.AddComponent<RaycastVisualizer>();
                 }
                 if (targetVisualizer == null) {
                     GameObject targetObj = new GameObject("AI_TargetVisualizer");
@@ -117,15 +110,26 @@ namespace Zeepkist.Ai
                     homingVisualizer = homingObj.AddComponent<CheckpointHomingVisualizer>();
                 }
 
-                playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
-                if (pendingSpawnIndex >= 0) {
-                    int spawnIdx = pendingSpawnIndex;
-                    pendingSpawnIndex = -1;
-                    UnityMainThreadDispatcher.Instance().Enqueue(() => {
+                UnityMainThreadDispatcher.Instance().Enqueue(() => {
+                    try {
+                        if (PlayerManager.Instance?.currentMaster?.carSetups != null && PlayerManager.Instance.currentMaster.carSetups.Count > 0) {
+                            playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
+                            staticLogger.LogInfo($"[AI_DEBUG] PlayerSpawned: Resolved playerCar successfully.");
+                        } else {
+                            staticLogger.LogWarning($"[AI_DEBUG] PlayerSpawned: carSetups is empty!");
+                        }
+                    } catch (Exception ex) {
+                        staticLogger.LogError($"[AI_DEBUG] PlayerSpawned: Exception resolving playerCar: {ex.Message}");
+                    }
+
+                    if (pendingSpawnIndex >= 0) {
+                        int spawnIdx = pendingSpawnIndex;
+                        pendingSpawnIndex = -1;
                         TeleportCar(playerCar, spawnIdx);
                         UpdateNextCheckpointIndex();
-                    });
-                }
+                    }
+                });
+
                 string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
                 lastResetReason = "None";
                 
@@ -145,9 +149,9 @@ namespace Zeepkist.Ai
                 }
             };
 
-            RacingApi.Crashed += (reason) => { playerCar = null; lastResetReason = "Crashed: " + reason; };
-            RacingApi.CrossedFinishLine += (time) => { playerCar = null; lastResetReason = "Finished"; };
-            RacingApi.WheelBroken += () => { playerCar = null; lastResetReason = "Wheel Broken"; };
+            RacingApi.Crashed += (reason) => { playerCar = null; isRoundActive = false; lastResetReason = "Crashed: " + reason; };
+            RacingApi.CrossedFinishLine += (time) => { playerCar = null; isRoundActive = false; lastResetReason = "Finished"; };
+            RacingApi.WheelBroken += () => { playerCar = null; isRoundActive = false; lastResetReason = "Wheel Broken"; };
 
             SetupNetwork();
             Logger.LogInfo($"[AI_DEBUG] Plugin fully initialized!");
@@ -345,9 +349,20 @@ namespace Zeepkist.Ai
                 if (PlayerManager.Instance?.currentMaster != null) {
                     pendingSpawnIndex = CurrentInput.SpawnIndex;
                     PlayerManager.Instance.currentMaster.RestartLevel();
-                    CurrentInput.Reset = false; playerCar = null;
+                    CurrentInput.Reset = false; playerCar = null; isRoundActive = false;
                 }
             }
+
+            // Self-healing: Resolve playerCar if active but null
+            if (isRoundActive && (playerCar == null || playerCar.gameObject == null)) {
+                try {
+                    if (PlayerManager.Instance?.currentMaster?.carSetups != null && PlayerManager.Instance.currentMaster.carSetups.Count > 0) {
+                        playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
+                        staticLogger.LogInfo("[AI_DEBUG] FixedUpdate self-healed: Resolved playerCar successfully.");
+                    }
+                } catch { }
+            }
+
             UpdateNextCheckpointIndex();
             SendTelemetry();
         }
@@ -359,22 +374,7 @@ namespace Zeepkist.Ai
                 using (BinaryWriter writer = new BinaryWriter(ms)) {
                     if (playerCar != null && playerCar.gameObject != null && playerCar.rb != null) {
                         var transform = playerCar.transform;
-                        float[] rayDistances = new float[75];
                         
-                        // 3 Layers: Low (-15 deg), Mid (0 deg), High (+15 deg)
-                        for (int layer = 0; layer < 3; layer++) {
-                            float pitch = -15f + (layer * 15f);
-                            for (int i = 0; i < 25; i++) {
-                                int idx = (layer * 25) + i;
-                                float yaw = -60f + (i * (120f / 24f));
-                                // Make direction truly local to the car
-                                Vector3 localDir = Quaternion.Euler(pitch, yaw, 0) * Vector3.forward;
-                                Vector3 dir = transform.TransformDirection(localDir);
-                                float range = Mathf.Lerp(100f, 20f, Mathf.Abs(yaw) / 60f);
-                                rayDistances[idx] = GetSphereCast(dir, range, idx);
-                            }
-                        }
-
                         bool isSlipping = false;
                         float friction = 0.0f;
                         bool isGrounded = false;
@@ -426,7 +426,6 @@ namespace Zeepkist.Ai
                         writer.Write(playerCar.rb.angularVelocity.x); writer.Write(playerCar.rb.angularVelocity.y); writer.Write(playerCar.rb.angularVelocity.z);
                         writer.Write(playerCar.rb.velocity.magnitude);
                         writer.Write(true); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(checkpointReached);
-                        foreach (float r in rayDistances) writer.Write(r);
                         writer.Write(isSlipping);
                         writer.Write(isGrounded);
                         writer.Write(friction);
@@ -447,7 +446,6 @@ namespace Zeepkist.Ai
                         writer.Write(0f); writer.Write(0f); writer.Write(0f);
                         writer.Write(0f);
                         writer.Write(false); writer.Write(ghostLoaded); writer.Write(ghostReady); writer.Write(false);
-                        for (int i = 0; i < 75; i++) writer.Write(0f);
                         writer.Write(false);
                         writer.Write(false);
                         writer.Write(1.0f);
@@ -464,26 +462,7 @@ namespace Zeepkist.Ai
             } catch { }
         }
 
-        private float GetSphereCast(Vector3 direction, float maxDist, int index = -1)
-        {
-            if (playerCar == null) return maxDist;
-            Vector3 origin = playerCar.transform.position + playerCar.transform.up * 1.0f;
-            RaycastHit hit;
-            float startOffset = 2.0f;
-            float dist = maxDist;
-            bool isObstacle = false;
-            
-            // Ignore the player car layer
-            int layerMask = ~(1 << playerCar.gameObject.layer);
-            
-            Vector3 castOrigin = origin + direction * startOffset;
-            if (Physics.SphereCast(castOrigin, 0.75f, direction, out hit, maxDist - startOffset, layerMask)) {
-                dist = startOffset + hit.distance;
-                if (Mathf.Abs(hit.normal.y) < 0.8f) { isObstacle = true; }
-            }
-            if (rayVisualizer != null && index >= 0) rayVisualizer.UpdateRay(index, origin, origin + direction * dist, isObstacle);
-            return dist;
-        }
+
 
         private static int GetClosestGhostFrameIndex(Vector3 pos)
         {
@@ -636,54 +615,7 @@ namespace Zeepkist.Ai
         public void UpdateLine(List<Vector3> points) { line.positionCount = points.Count; line.SetPositions(points.ToArray()); }
     }
 
-    public class RaycastVisualizer : MonoBehaviour {
-        private LineRenderer[] lines;
-        private static int debugLogCounter = 0;
 
-        private void Awake() {
-            lines = new LineRenderer[75];
-            for (int i = 0; i < 75; i++) {
-                GameObject obj = new GameObject($"Ray_{i}");
-                obj.transform.SetParent(this.transform);
-                lines[i] = obj.AddComponent<LineRenderer>();
-                lines[i].useWorldSpace = true;
-                lines[i].positionCount = 2;
-                lines[i].material = new Material(Shader.Find("Sprites/Default"));
-            }
-        }
-        public void UpdateRay(int idx, Vector3 start, Vector3 end, bool hit) {
-            if (lines == null || idx < 0 || idx >= lines.Length || lines[idx] == null) return;
-            lines[idx].enabled = Plugin.ShowEyesightLines.Value;
-            if (!lines[idx].enabled) return;
-            
-            lines[idx].SetPositions(new Vector3[] { start, end });
-            Color c;
-            if (idx < 25) c = Color.cyan;
-            else if (idx < 50) c = Color.yellow;
-            else c = Color.magenta;
-            
-            if (hit) c = Color.red;
-            lines[idx].startColor = c; lines[idx].endColor = c;
-
-            if (idx == 0) {
-                debugLogCounter++;
-                if (debugLogCounter % 300 == 0) {
-                    UnityEngine.Debug.Log($"[AI_DEBUG] Ray 0: Start={start}, End={end}, Length={Vector3.Distance(start, end):F2}, Hit={hit}, Enabled={lines[idx].enabled}");
-                }
-            }
-        }
-        private void Update() { 
-            bool show = Plugin.playerCar != null && Plugin.EnableAi.Value && Plugin.ShowEyesightLines.Value;
-            float width = Plugin.EyesightLineWidth.Value;
-            foreach (var l in lines) {
-                if (l != null) {
-                    l.enabled = show;
-                    l.startWidth = width;
-                    l.endWidth = width;
-                }
-            }
-        }
-    }
 
     public class TargetVisualizer : MonoBehaviour {
         private GameObject[] markers;
