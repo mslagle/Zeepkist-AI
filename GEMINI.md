@@ -27,8 +27,7 @@
 - **Reward Function:** 
   - **Progress (Primary):** Reward for reaching new furthest ghost index points (+5.0 per index).
   - **Checkpoint Bonus:** Large reward (+500.0) for crossing checkpoints.
-  - **Speed on Path:** Rewards high speed when closely adhering to the ghost path: `vel_local[2] * exp(-dist_to_path * 0.3) * 0.5`.
-  - **Path Distance Penalty:** Linear penalty (`-0.2 * dist_to_path`) to guide the car back to the path when lost.
+  - **Speed on Path:** Rewards high speed when closely adhering to the ghost path: `vel_local[2] * exp(-dist_to_path * 0.3) * 0.5`. This naturally guides the car back to the path using the smooth exponential gradient of the reward.
   - **Smoothness Penalties:** Momentum decay penalty, swerving/steering-change penalty, air spin penalty, and braking penalties.
 - **Groundedness:** Direct boolean `IsGrounded` from telemetry.
 - **Stuck Detection:** Resets if `speed < 1.0` for > 5 seconds.

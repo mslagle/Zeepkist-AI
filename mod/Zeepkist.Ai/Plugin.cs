@@ -132,20 +132,10 @@ namespace Zeepkist.Ai
 
                 string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
                 lastResetReason = "None";
+                currentLevelHash = newHash;
                 
-                if (newHash != currentLevelHash || cachedFrames == null) {
-                    Logger.LogInfo($"[AI_DEBUG] Level setup: Hash={newHash}, CacheReady={cachedFrames != null}. Fetching ghost.");
-                    currentLevelHash = newHash;
-                    ghostLoaded = false;
-                    lock (ghostLock) { ghostReady = false; currentGhostBinary = null; }
-                    cachedFrames = null;
-                    cachedHash = "";
-                    Task.Run(() => FetchAndProcessGhost(currentLevelHash));
-                } else {
-                    lock (ghostLock) { ghostReady = true; }
-                    if (visualizer != null && ShowGhostPath.Value && cachedFrames != null) {
-                        visualizer.UpdateLine(cachedFrames.Select(f => f.Position).ToList());
-                    }
+                if (EnableAi.Value) {
+                    TriggerGhostFetch();
                 }
             };
 
@@ -185,6 +175,21 @@ namespace Zeepkist.Ai
                 Logger.LogInfo("[AI_DEBUG] ghostReady is now TRUE.");
             } catch (Exception ex) {
                 Logger.LogError($"[AI_DEBUG] Critical error in FetchAndProcessGhost: {ex.Message}");
+            }
+        }
+
+        private void TriggerGhostFetch()
+        {
+            string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel?.UID ?? "Unknown";
+            if (newHash != "Unknown" && (newHash != cachedHash || cachedFrames == null)) {
+                Logger.LogInfo($"[AI_DEBUG] Triggering ghost fetch for {newHash}...");
+                cachedHash = newHash;
+                ghostLoaded = false;
+                lock (ghostLock) { ghostReady = false; currentGhostBinary = null; }
+                cachedFrames = null;
+                Task.Run(() => FetchAndProcessGhost(cachedHash));
+            } else if (visualizer != null && ShowGhostPath.Value && cachedFrames != null) {
+                visualizer.UpdateLine(cachedFrames.Select(f => f.Position).ToList());
             }
         }
 
@@ -312,7 +317,11 @@ namespace Zeepkist.Ai
             if (Input.GetKeyDown(KeyCode.F9)) {
                 EnableAi.Value = !EnableAi.Value;
                 Logger.LogInfo($"[AI_DEBUG] AI CONTROL: {(EnableAi.Value ? "ENABLED" : "DISABLED")}");
-                if (!EnableAi.Value) Time.timeScale = 1.0f;
+                if (!EnableAi.Value) {
+                    Time.timeScale = 1.0f;
+                } else {
+                    TriggerGhostFetch();
+                }
             }
 
             if (EnableAi.Value && Input.GetKeyDown(KeyCode.F10)) {
@@ -613,6 +622,11 @@ namespace Zeepkist.Ai
             line.startColor = Color.magenta; line.endColor = Color.magenta;
         }
         public void UpdateLine(List<Vector3> points) { line.positionCount = points.Count; line.SetPositions(points.ToArray()); }
+        private void Update() {
+            if (line != null) {
+                line.enabled = Plugin.EnableAi.Value && Plugin.ShowGhostPath.Value;
+            }
+        }
     }
 
 
@@ -641,7 +655,12 @@ namespace Zeepkist.Ai
                 } else markers[i].SetActive(false);
             }
         }
-        private void Update() { if (Plugin.playerCar == null) foreach (var m in markers) if (m != null) m.SetActive(false); }
+        private void Update() { 
+            bool show = Plugin.playerCar != null && Plugin.EnableAi.Value;
+            foreach (var m in markers) {
+                if (m != null) m.SetActive(show);
+            }
+        }
     }
 
     public class CheckpointHomingVisualizer : MonoBehaviour {

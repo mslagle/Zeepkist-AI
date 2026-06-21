@@ -296,9 +296,6 @@ class ZeepkistEnv(gym.Env):
         speed_on_path = vel_local[2] * np.exp(-dist_to_path * 0.3)
         reward += speed_on_path * 0.5
         
-        # 3. PATH DISTANCE PENALTY (Guides the agent back if it wanders off)
-        reward -= dist_to_path * 0.2
-        
         # 4. MOMENTUM CONSERVATION (Smooth steering)
         steering = action[0]
         reward -= abs(steering) * (speed / 100.0) * 0.05
