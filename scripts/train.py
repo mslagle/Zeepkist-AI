@@ -3,9 +3,10 @@ import os
 import time
 import torch
 import numpy as np
+import argparse
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from zeep_env import ZeepkistEnv
 
@@ -87,11 +88,21 @@ class Logger(object):
     def flush(self):
         self.terminal.flush(); self.log.flush()
 
+import argparse
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+
 USE_CURRICULUM = False # Set to False to disable mid-race restarts (curriculum learning)
 
-def make_env(): return Monitor(ZeepkistEnv(use_curriculum=USE_CURRICULUM))
+def make_env_fn(instance_id):
+    def _init():
+        return Monitor(ZeepkistEnv(instance_id=instance_id, use_curriculum=USE_CURRICULUM))
+    return _init
 
 def train():
+    parser = argparse.ArgumentParser(description="Zeepkist AI Training")
+    parser.add_argument("--instances", type=int, default=1, help="Number of concurrent game replicas (default: 1)")
+    args = parser.parse_args()
+
     sys.stdout = Logger("zeepkist_training.log")
     sys.stderr = sys.stdout
 
@@ -100,10 +111,14 @@ def train():
     stats_path = "zeepkist_vec_normalize.pkl"
 
     print("\n" + "="*50)
-    print("New Physics-Aware Training Session Started")
+    print(f"New Training Session Started (Replicas: {args.instances})")
     print("="*50)
 
-    venv = DummyVecEnv([make_env])
+    if args.instances > 1:
+        print(f"Creating parallel SubprocVecEnv across {args.instances} game instances...")
+        venv = SubprocVecEnv([make_env_fn(i) for i in range(args.instances)])
+    else:
+        venv = DummyVecEnv([make_env_fn(0)])
     
     env = None
     if os.path.exists(stats_path):

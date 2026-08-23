@@ -11,7 +11,9 @@ using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using ZeepSDK.Racing;
 using ZeepSDK.Level;
 using Newtonsoft.Json;
@@ -26,6 +28,12 @@ namespace Zeepkist.Ai
     public class Plugin : BaseUnityPlugin
     {
         private Harmony harmony;
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowPos")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll", EntryPoint = "GetActiveWindow")]
+        private static extern IntPtr GetActiveWindow();
 
         public static ConfigEntry<bool> EnableAi { get; private set; }
         public static ConfigEntry<bool> ShowGhostPath { get; private set; }
@@ -70,10 +78,50 @@ namespace Zeepkist.Ai
         private static int inputPacketCount = 0;
         private static DateTime lastInputTime = DateTime.MinValue;
 
+        private static string autoTrackName = null;
+        private static bool hasAutoLoaded = false;
+        private static int winPosX = -1;
+        private static int winPosY = -1;
+        private static int winWidth = 640;
+        private static int winHeight = 360;
+
         private void Awake()
         {
             staticLogger = Logger;
             Logger.LogInfo("[AI_DEBUG] === Plugin.Awake() STARTING ===");
+
+            // Parse Command-line arguments
+            string[] args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (args[i].Equals("-autoTrack", StringComparison.OrdinalIgnoreCase))
+                {
+                    autoTrackName = args[i + 1];
+                    Logger.LogInfo($"[AI_DEBUG] Auto-track requested via CLI: {autoTrackName}");
+                }
+                else if (args[i].Equals("-winX", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(args[i + 1], out winPosX);
+                }
+                else if (args[i].Equals("-winY", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(args[i + 1], out winPosY);
+                }
+                else if (args[i].Equals("-winW", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(args[i + 1], out winWidth);
+                }
+                else if (args[i].Equals("-winH", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(args[i + 1], out winHeight);
+                }
+            }
+
+            if (winPosX >= 0 || args.Any(a => a.Equals("-windowed", StringComparison.OrdinalIgnoreCase) || a.Equals("-aiPortOffset", StringComparison.OrdinalIgnoreCase)))
+            {
+                StartCoroutine(EnforceWindowLayoutCoroutine());
+            }
+
             harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
             harmony.PatchAll();
 
@@ -88,6 +136,8 @@ namespace Zeepkist.Ai
             CpHomingLineWidth = Config.Bind<float>("Visuals", "CP Homing Line Width", 0.20f);
 
             gtrClient = new GtrClient.GtrClient(Logger);
+
+            SceneManager.sceneLoaded += OnSceneLoaded;
 
             RacingApi.PassedCheckpoint += (time) => {
                 checkpointReached = true;
@@ -147,6 +197,113 @@ namespace Zeepkist.Ai
             Logger.LogInfo($"[AI_DEBUG] Plugin fully initialized!");
         }
 
+        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            if (!hasAutoLoaded && !string.IsNullOrEmpty(autoTrackName) && scene.name.Contains("Menu"))
+            {
+                hasAutoLoaded = true;
+                Logger.LogInfo($"[AI_AUTO] Detected Main Menu. Auto-loading track '{autoTrackName}' in 2 seconds...");
+                StartCoroutine(AutoLoadTrackCoroutine(autoTrackName));
+            }
+        }
+
+        private System.Collections.IEnumerator AutoLoadTrackCoroutine(string track)
+        {
+            yield return new WaitForSeconds(3.0f);
+            try
+            {
+                EnableAi.Value = true;
+                Logger.LogInfo($"[AI_AUTO] Initiating auto-load for track: '{track}'");
+
+                LevelScriptableObject targetLevel = null;
+
+                if (LevelManager.Instance != null)
+                {
+                    LevelManager.Instance.TryGetLevel(track, out targetLevel);
+                    if (targetLevel == null)
+                    {
+                        var all = LevelManager.Instance.GetAllLevels();
+                        if (all != null)
+                        {
+                            targetLevel = all.FirstOrDefault(l => l != null && (
+                                string.Equals(l.UID, track, StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(l.name, track, StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(l.Name, track, StringComparison.OrdinalIgnoreCase)));
+                        }
+                    }
+                }
+
+                if (targetLevel == null && PlayerManager.Instance?.allAdventureLevelsSO?.Levels != null)
+                {
+                    targetLevel = PlayerManager.Instance.allAdventureLevelsSO.Levels.FirstOrDefault(l => l != null && (
+                        string.Equals(l.UID, track, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(l.name, track, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(l.Name, track, StringComparison.OrdinalIgnoreCase)));
+                }
+
+                if (targetLevel != null)
+                {
+                    Logger.LogInfo($"[AI_AUTO] Found level '{targetLevel.Name}' (UID: {targetLevel.UID}). Preparing GlobalLevel and loading GameScene...");
+
+                    var selectMenus = Resources.FindObjectsOfTypeAll<SelectNextLevelMenu>();
+                    foreach (var m in selectMenus)
+                    {
+                        if (m != null && m.GlobalLevel != null)
+                        {
+                            m.GlobalLevel.Copy(targetLevel);
+                        }
+                    }
+
+                    var allSOs = Resources.FindObjectsOfTypeAll<LevelScriptableObject>();
+                    foreach (var so in allSOs)
+                    {
+                        if (so != null && (so.name == "GlobalLevel" || so.name.Contains("Global")))
+                        {
+                            so.Copy(targetLevel);
+                        }
+                    }
+
+                    if (targetLevel is AdventureLevelScriptableObject adv)
+                    {
+                        if (PlayerManager.Instance != null) PlayerManager.Instance.adventureSelectedLevel = adv;
+                    }
+                    else if (PlayerManager.Instance != null)
+                    {
+                        PlayerManager.Instance.adventureSelectedLevel = null;
+                    }
+
+                    SceneManager.LoadScene("GameScene");
+                    Logger.LogInfo("[AI_AUTO] SceneManager.LoadScene('GameScene') called successfully!");
+                }
+                else
+                {
+                    Logger.LogWarning($"[AI_AUTO] Could not resolve level for '{track}'.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"[AI_AUTO] Failed to auto-load track '{track}': {ex.Message}");
+            }
+        }
+
+        private System.Collections.IEnumerator EnforceWindowLayoutCoroutine()
+        {
+            for (int i = 0; i < 20; i++)
+            {
+                yield return new WaitForSeconds(0.25f);
+                try
+                {
+                    Screen.SetResolution(winWidth, winHeight, FullScreenMode.Windowed);
+                    IntPtr hwnd = GetActiveWindow();
+                    if (hwnd != IntPtr.Zero && winPosX >= 0 && winPosY >= 0)
+                    {
+                        SetWindowPos(hwnd, IntPtr.Zero, winPosX, winPosY, winWidth, winHeight, 0x0040);
+                    }
+                }
+                catch { }
+            }
+        }
+
         private async Task FetchAndProcessGhost(string hash)
         {
             if (hash == "Unknown") return;
@@ -196,22 +353,35 @@ namespace Zeepkist.Ai
         private void SetupNetwork()
         {
             try {
+                // Support multi-instance command-line argument: -aiPortOffset 10
+                int portOffset = 0;
+                string[] args = Environment.GetCommandLineArgs();
+                for (int i = 0; i < args.Length - 1; i++) {
+                    if (args[i].Equals("-aiPortOffset", StringComparison.OrdinalIgnoreCase)) {
+                        int.TryParse(args[i + 1], out portOffset);
+                        break;
+                    }
+                }
+
+                int telemPort = TelemetryPort.Value + portOffset;
+                int inPort = InputPort.Value + portOffset;
+                int ptsPort = PointsTcpPort.Value + portOffset;
+
                 telemetryClient = new UdpClient();
                 telemetryClient.Client.SendBufferSize = 65536;
-                telemetryEndPoint = new IPEndPoint(IPAddress.Parse("127.0.0.1"), TelemetryPort.Value);
+                telemetryEndPoint = new IPEndPoint(IPAddress.Parse("127.0.0.1"), telemPort);
 
-                inputServer = new UdpClient(InputPort.Value);
+                inputServer = new UdpClient(inPort);
                 inputServer.Client.ReceiveBufferSize = 65536;
-                inputEndPoint = new IPEndPoint(IPAddress.Any, InputPort.Value);
+                inputEndPoint = new IPEndPoint(IPAddress.Any, inPort);
                 
-                // Start dedicated background thread for receiving inputs
                 Thread receiveThread = new Thread(InputReceiverLoop);
                 receiveThread.IsBackground = true;
                 receiveThread.Start();
 
-                pointsTcpListener = new TcpListener(IPAddress.Any, PointsTcpPort.Value);
+                pointsTcpListener = new TcpListener(IPAddress.Any, ptsPort);
                 pointsTcpListener.Start();
-                Logger.LogInfo($"[AI_DEBUG] TCP Points Server started on port {PointsTcpPort.Value}");
+                Logger.LogInfo($"[AI_DEBUG] Network initialized (Telemetry: {telemPort}, Input: {inPort}, Points: {ptsPort})");
                 
                 Task.Run(async () => {
                     while (true) {
@@ -235,6 +405,36 @@ namespace Zeepkist.Ai
                     }
                 });
             } catch (Exception ex) { Logger.LogError($"AI Network Setup Error: {ex.Message}"); }
+        }
+
+        private static bool IsAiActive()
+        {
+            return EnableAi.Value && (DateTime.Now - lastInputTime).TotalMilliseconds <= 500;
+        }
+
+        private void OnGUI()
+        {
+            if (!EnableAi.Value) return;
+
+            GUI.color = Color.white;
+            GUI.Box(new Rect(10, 10, 270, 110), "=== Zeepkist AI HUD ===");
+            
+            bool active = IsAiActive();
+            GUI.Label(new Rect(20, 30, 250, 20), $"Status: {(active ? "<color=green>AI ACTIVE</color>" : "<color=yellow>STANDBY / MANUAL</color>")}");
+            GUI.Label(new Rect(20, 50, 250, 20), $"Speed: {Time.timeScale:F1}x | Track: {currentLevelHash}");
+            
+            float steer = CurrentInput != null ? CurrentInput.Steering : 0f;
+            float brake = CurrentInput != null ? CurrentInput.Brake : 0f;
+            float arms = CurrentInput != null ? CurrentInput.ArmsUp : 0f;
+            
+            GUI.Label(new Rect(20, 70, 250, 20), $"Steer: {steer:+0.00;-0.00; 0.00} | Brake: {brake:F2} | Arms: {arms:F2}");
+
+            int barLen = 18;
+            int steerPos = Mathf.Clamp((int)((steer + 1f) * 0.5f * barLen), 0, barLen);
+            char[] bar = new string('-', barLen).ToCharArray();
+            bar[barLen / 2] = '|';
+            bar[steerPos] = 'O';
+            GUI.Label(new Rect(20, 88, 250, 20), $"[{new string(bar)}]");
         }
 
         private static void InputReceiverLoop()
@@ -583,15 +783,92 @@ namespace Zeepkist.Ai
 
         public void OnDestroy() { harmony?.UnpatchSelf(); inputServer?.Close(); telemetryClient?.Close(); pointsTcpListener?.Stop(); }
 
-        [HarmonyPatch(typeof(New_ControlCar), "Update")]
-        public static class New_ControlCar_Update_Patch {
-            public static void Postfix(New_ControlCar __instance) {
-                if (EnableAi.Value && CurrentInput != null && playerCar != null && __instance == playerCar) {
-                    if (__instance.SteerAction2 != null) __instance.SteerAction2.axis = CurrentInput.Steering;
-                    if (__instance.BrakeAction2 != null) { __instance.BrakeAction2.axis = CurrentInput.Brake; __instance.BrakeAction2.buttonHeld = CurrentInput.Brake > 0.5f; }
-                    if (__instance.PitchBackwardAction2 != null) { __instance.PitchBackwardAction2.axis = CurrentInput.Brake; __instance.PitchBackwardAction2.buttonHeld = CurrentInput.Brake > 0.5f; }
-                    if (__instance.ArmsUpAction2 != null) { __instance.ArmsUpAction2.axis = CurrentInput.ArmsUp; __instance.ArmsUpAction2.buttonHeld = CurrentInput.ArmsUp > 0.5f; }
+        // =========================================================================
+        // DIRECT INPUT PREFIX PATCHES (Bulletproof steering, braking, and arms-up)
+        // =========================================================================
+
+        [HarmonyPatch(typeof(New_ControlCar), "GetSteerActionButLimited")]
+        public static class GetSteerActionButLimited_Patch {
+            public static bool Prefix(New_ControlCar __instance, ref float __result) {
+                if (EnableAi.Value && playerCar != null && __instance == playerCar && IsAiActive() && CurrentInput != null) {
+                    __result = CurrentInput.Steering;
+                    return false; // Skip original game computation, apply steering directly
                 }
+                return true;
+            }
+        }
+
+        [HarmonyPatch(typeof(New_ControlCar), "GetBrakeAxis")]
+        public static class GetBrakeAxis_Patch {
+            public static bool Prefix(New_ControlCar __instance, ref float __result) {
+                if (EnableAi.Value && playerCar != null && __instance == playerCar && IsAiActive() && CurrentInput != null) {
+                    __result = CurrentInput.Brake;
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        [HarmonyPatch(typeof(New_ControlCar), "GetBrakeHeld")]
+        public static class GetBrakeHeld_Patch {
+            public static bool Prefix(New_ControlCar __instance, ref bool __result) {
+                if (EnableAi.Value && playerCar != null && __instance == playerCar && IsAiActive() && CurrentInput != null) {
+                    __result = CurrentInput.Brake > 0.5f;
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        [HarmonyPatch(typeof(New_ControlCar), "GetArmsUpAxis")]
+        public static class GetArmsUpAxis_Patch {
+            public static bool Prefix(New_ControlCar __instance, ref float __result) {
+                if (EnableAi.Value && playerCar != null && __instance == playerCar && IsAiActive() && CurrentInput != null) {
+                    __result = CurrentInput.ArmsUp;
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        [HarmonyPatch(typeof(New_ControlCar), "GetArmsUpHeld")]
+        public static class GetArmsUpHeld_Patch {
+            public static bool Prefix(New_ControlCar __instance, ref bool __result) {
+                if (EnableAi.Value && playerCar != null && __instance == playerCar && IsAiActive() && CurrentInput != null) {
+                    __result = CurrentInput.ArmsUp > 0.5f;
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        [HarmonyPatch(typeof(Steamworks.SteamClient), "RestartAppIfNecessary")]
+        public static class SteamClient_RestartAppIfNecessary_Patch {
+            public static bool Prefix(ref bool __result) {
+                __result = false;
+                return false; // Skip restart check so multiple instances don't quit
+            }
+        }
+
+        [HarmonyPatch(typeof(SteamManager), "Awake")]
+        public static class SteamManager_Awake_Patch {
+            public static Exception Finalizer(Exception __exception) {
+                if (__exception != null) {
+                    staticLogger?.LogWarning($"[AI_DEBUG] Caught and handled SteamManager exception: {__exception.Message}");
+                }
+                return null;
+            }
+        }
+
+        [HarmonyPatch(typeof(Instellingen), "ApplyGraphicsSettings")]
+        public static class Instellingen_ApplyGraphicsSettings_Patch {
+            public static bool Prefix(bool force) {
+                string[] args = Environment.GetCommandLineArgs();
+                if (winPosX >= 0 || args.Any(a => a.Equals("-aiPortOffset", StringComparison.OrdinalIgnoreCase) || a.Equals("-windowed", StringComparison.OrdinalIgnoreCase))) {
+                    Screen.SetResolution(winWidth, winHeight, FullScreenMode.Windowed);
+                    return false; // Skip enforcing user fullscreen settings on AI replicas
+                }
+                return true;
             }
         }
     }

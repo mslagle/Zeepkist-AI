@@ -8,12 +8,20 @@ import os
 import struct
 
 class ZeepkistEnv(gym.Env):
-    def __init__(self, telemetry_port=9090, input_port=9091, points_port=9092, host='127.0.0.1', use_curriculum=False):
+    def __init__(self, telemetry_port=9090, input_port=9091, points_port=9092, host='127.0.0.1', use_curriculum=False, instance_id=None):
         super(ZeepkistEnv, self).__init__()
 
-        self.telemetry_port = telemetry_port
-        self.input_port = input_port
-        self.points_port = points_port
+        if instance_id is not None:
+            port_offset = instance_id * 10
+            self.telemetry_port = 9090 + port_offset
+            self.input_port = 9091 + port_offset
+            self.points_port = 9092 + port_offset
+        else:
+            self.telemetry_port = telemetry_port
+            self.input_port = input_port
+            self.points_port = points_port
+
+        self.instance_id = instance_id if instance_id is not None else 0
         self.host = host
         self.use_curriculum = use_curriculum
 
