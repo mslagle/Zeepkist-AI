@@ -32,6 +32,9 @@ namespace Zeepkist.Ai
         [DllImport("user32.dll", EntryPoint = "SetWindowPos")]
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
+        [DllImport("user32.dll", EntryPoint = "SetWindowText", CharSet = CharSet.Auto)]
+        private static extern bool SetWindowText(IntPtr hWnd, string lpString);
+
         [DllImport("user32.dll", EntryPoint = "GetActiveWindow")]
         private static extern IntPtr GetActiveWindow();
 
@@ -43,6 +46,8 @@ namespace Zeepkist.Ai
         public static ConfigEntry<int> PointsTcpPort { get; private set; }
         public static ConfigEntry<bool> ShowCpHomingLine { get; private set; }
         public static ConfigEntry<float> CpHomingLineWidth { get; private set; }
+
+        private static volatile bool isShuttingDown = false;
 
         private static UdpClient telemetryClient;
         private static IPEndPoint telemetryEndPoint;
@@ -59,6 +64,8 @@ namespace Zeepkist.Ai
         private static bool checkpointReached = false;
         private static CheckpointHomingVisualizer homingVisualizer = null;
         private static bool isRoundActive = false;
+        private static bool isRewardFrozen = false;
+        private static float lastFrozenReward = 0f;
 
         private static GtrClient.GtrClient gtrClient;
         private static List<GhostFrame> cachedFrames = null;
@@ -82,8 +89,9 @@ namespace Zeepkist.Ai
         private static bool hasAutoLoaded = false;
         private static int winPosX = -1;
         private static int winPosY = -1;
-        private static int winWidth = 640;
-        private static int winHeight = 360;
+        private static int winWidth = 960;
+        private static int winHeight = 540;
+        private static int instanceIndex = 1;
 
         private void Awake()
         {
@@ -114,6 +122,13 @@ namespace Zeepkist.Ai
                 else if (args[i].Equals("-winH", StringComparison.OrdinalIgnoreCase))
                 {
                     int.TryParse(args[i + 1], out winHeight);
+                }
+                else if (args[i].Equals("-aiPortOffset", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(args[i + 1], out int offset))
+                    {
+                        instanceIndex = (offset / 10) + 1;
+                    }
                 }
             }
 
@@ -171,27 +186,40 @@ namespace Zeepkist.Ai
                     } catch (Exception ex) {
                         staticLogger.LogError($"[AI_DEBUG] PlayerSpawned: Exception resolving playerCar: {ex.Message}");
                     }
-
-                    if (pendingSpawnIndex >= 0) {
-                        int spawnIdx = pendingSpawnIndex;
-                        pendingSpawnIndex = -1;
-                        TeleportCar(playerCar, spawnIdx);
-                        UpdateNextCheckpointIndex();
-                    }
                 });
 
                 string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel.UID;
                 lastResetReason = "None";
                 currentLevelHash = newHash;
+                isRewardFrozen = false;
                 
-                if (EnableAi.Value) {
+                if (EnableAi.Value)
+                {
                     TriggerGhostFetch();
                 }
             };
 
-            RacingApi.Crashed += (reason) => { playerCar = null; isRoundActive = false; lastResetReason = "Crashed: " + reason; };
-            RacingApi.CrossedFinishLine += (time) => { playerCar = null; isRoundActive = false; lastResetReason = "Finished"; };
-            RacingApi.WheelBroken += () => { playerCar = null; isRoundActive = false; lastResetReason = "Wheel Broken"; };
+            RacingApi.Crashed += (reason) => { 
+                playerCar = null; 
+                isRoundActive = false; 
+                isRewardFrozen = true; 
+                lastFrozenReward = CurrentInput != null ? CurrentInput.Reward : 0f;
+                lastResetReason = "Crashed: " + reason; 
+            };
+            RacingApi.CrossedFinishLine += (time) => { 
+                playerCar = null; 
+                isRoundActive = false; 
+                isRewardFrozen = true; 
+                lastFrozenReward = CurrentInput != null ? CurrentInput.Reward : 0f;
+                lastResetReason = "Finished"; 
+            };
+            RacingApi.WheelBroken += () => { 
+                playerCar = null; 
+                isRoundActive = false; 
+                isRewardFrozen = true; 
+                lastFrozenReward = CurrentInput != null ? CurrentInput.Reward : 0f;
+                lastResetReason = "Wheel Broken"; 
+            };
 
             SetupNetwork();
             Logger.LogInfo($"[AI_DEBUG] Plugin fully initialized!");
@@ -199,23 +227,26 @@ namespace Zeepkist.Ai
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
-            if (!hasAutoLoaded && !string.IsNullOrEmpty(autoTrackName) && scene.name.Contains("Menu"))
+            Logger.LogInfo($"[AI_SCENE] Scene Loaded: '{scene.name}' (BuildIndex: {scene.buildIndex})");
+            if (!hasAutoLoaded && !string.IsNullOrEmpty(autoTrackName) && (scene.name.IndexOf("menu", StringComparison.OrdinalIgnoreCase) >= 0 || scene.name.IndexOf("main", StringComparison.OrdinalIgnoreCase) >= 0))
             {
                 hasAutoLoaded = true;
-                Logger.LogInfo($"[AI_AUTO] Detected Main Menu. Auto-loading track '{autoTrackName}' in 2 seconds...");
+                Logger.LogInfo($"[AI_AUTO] Detected Menu Scene '{scene.name}'. Auto-loading track '{autoTrackName}' in 1.5s...");
                 StartCoroutine(AutoLoadTrackCoroutine(autoTrackName));
             }
         }
 
         private System.Collections.IEnumerator AutoLoadTrackCoroutine(string track)
         {
-            yield return new WaitForSeconds(3.0f);
-            try
-            {
-                EnableAi.Value = true;
-                Logger.LogInfo($"[AI_AUTO] Initiating auto-load for track: '{track}'");
+            EnableAi.Value = true;
+            Logger.LogInfo($"[AI_AUTO] Initiating auto-load for track: '{track}'");
 
-                LevelScriptableObject targetLevel = null;
+            LevelScriptableObject targetLevel = null;
+
+            // Retry for up to 10 seconds to allow LevelManager to populate
+            for (int attempt = 0; attempt < 20; attempt++)
+            {
+                yield return new WaitForSeconds(0.5f);
 
                 if (LevelManager.Instance != null)
                 {
@@ -241,9 +272,14 @@ namespace Zeepkist.Ai
                         string.Equals(l.Name, track, StringComparison.OrdinalIgnoreCase)));
                 }
 
+                if (targetLevel != null) break;
+            }
+
+            try
+            {
                 if (targetLevel != null)
                 {
-                    Logger.LogInfo($"[AI_AUTO] Found level '{targetLevel.Name}' (UID: {targetLevel.UID}). Preparing GlobalLevel and loading GameScene...");
+                    Logger.LogInfo($"[AI_AUTO] Resolved level '{targetLevel.Name}' (UID: {targetLevel.UID}). Preparing GlobalLevel and loading GameScene...");
 
                     var selectMenus = Resources.FindObjectsOfTypeAll<SelectNextLevelMenu>();
                     foreach (var m in selectMenus)
@@ -277,7 +313,7 @@ namespace Zeepkist.Ai
                 }
                 else
                 {
-                    Logger.LogWarning($"[AI_AUTO] Could not resolve level for '{track}'.");
+                    Logger.LogWarning($"[AI_AUTO] Could not resolve level for '{track}' after 10 seconds.");
                 }
             }
             catch (Exception ex)
@@ -288,39 +324,51 @@ namespace Zeepkist.Ai
 
         private System.Collections.IEnumerator EnforceWindowLayoutCoroutine()
         {
-            for (int i = 0; i < 20; i++)
+            yield return new WaitForSeconds(0.5f);
+            try
+            {
+                if (Screen.fullScreen || Screen.width != winWidth || Screen.height != winHeight)
+                {
+                    Screen.SetResolution(winWidth, winHeight, FullScreenMode.Windowed);
+                }
+            }
+            catch { }
+
+            for (int i = 0; i < 15; i++)
             {
                 yield return new WaitForSeconds(0.25f);
                 try
                 {
-                    Screen.SetResolution(winWidth, winHeight, FullScreenMode.Windowed);
-                    IntPtr hwnd = GetActiveWindow();
-                    if (hwnd != IntPtr.Zero && winPosX >= 0 && winPosY >= 0)
+                    IntPtr hwnd = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle;
+                    if (hwnd != IntPtr.Zero)
                     {
-                        SetWindowPos(hwnd, IntPtr.Zero, winPosX, winPosY, winWidth, winHeight, 0x0040);
+                        SetWindowText(hwnd, $"Zeepkist #{instanceIndex}");
+                        if (winPosX >= 0 && winPosY >= 0)
+                        {
+                            SetWindowPos(hwnd, IntPtr.Zero, winPosX, winPosY, winWidth, winHeight, 0x0040);
+                        }
                     }
                 }
                 catch { }
             }
         }
 
-        private async Task FetchAndProcessGhost(string hash)
+        private static async Task FetchAndProcessGhost(string hash)
         {
             if (hash == "Unknown") return;
             try {
-                Logger.LogInfo($"[AI_DEBUG] Fetching best ghost for {hash}...");
                 string url = await gtrClient.GetBestGhostUrl(hash);
                 if (string.IsNullOrEmpty(url)) {
-                    Logger.LogError($"[AI_DEBUG] No ghost URL found for {hash}. AI tracking will be disabled.");
+                    staticLogger?.LogError($"[AI_DEBUG] No ghost URL found for {hash}. AI tracking will be disabled.");
                     return;
                 }
-                Logger.LogInfo($"[AI_DEBUG] Downloading/Parsing ghost: {url}");
+                staticLogger?.LogInfo($"[AI_DEBUG] Downloading/Parsing ghost: {url}");
                 List<GhostFrame> frames = await gtrClient.DownloadAndParseGhost(url);
-                if (frames == null) { Logger.LogError("[AI_DEBUG] Ghost parsing failed (returned null)."); return; }
+                if (frames == null) { staticLogger?.LogError("[AI_DEBUG] Ghost parsing failed (returned null)."); return; }
 
                 cachedFrames = frames;
                 cachedHash = hash;
-                Logger.LogInfo($"[AI_DEBUG] Successfully processed {frames.Count} points. Updating visualizer.");
+                staticLogger?.LogInfo($"[AI_DEBUG] Successfully processed {frames.Count} points. Updating visualizer.");
 
                 UnityMainThreadDispatcher.Instance().Enqueue(() => { 
                     if (visualizer != null && ShowGhostPath.Value) {
@@ -329,17 +377,17 @@ namespace Zeepkist.Ai
                     InitializeCheckpoints();
                 });
                 PrepareGhostBinary(frames, hash);
-                Logger.LogInfo("[AI_DEBUG] ghostReady is now TRUE.");
+                staticLogger?.LogInfo("[AI_DEBUG] ghostReady is now TRUE.");
             } catch (Exception ex) {
-                Logger.LogError($"[AI_DEBUG] Critical error in FetchAndProcessGhost: {ex.Message}");
+                staticLogger?.LogError($"[AI_DEBUG] Critical error in FetchAndProcessGhost: {ex.Message}");
             }
         }
 
-        private void TriggerGhostFetch()
+        private static void TriggerGhostFetch()
         {
             string newHash = LevelApi.CurrentHash ?? LevelApi.CurrentLevel?.UID ?? "Unknown";
             if (newHash != "Unknown" && (newHash != cachedHash || cachedFrames == null)) {
-                Logger.LogInfo($"[AI_DEBUG] Triggering ghost fetch for {newHash}...");
+                staticLogger?.LogInfo($"[AI_DEBUG] Triggering ghost fetch for {newHash}...");
                 cachedHash = newHash;
                 ghostLoaded = false;
                 lock (ghostLock) { ghostReady = false; currentGhostBinary = null; }
@@ -384,22 +432,39 @@ namespace Zeepkist.Ai
                 Logger.LogInfo($"[AI_DEBUG] Network initialized (Telemetry: {telemPort}, Input: {inPort}, Points: {ptsPort})");
                 
                 Task.Run(async () => {
-                    while (true) {
+                    while (!isShuttingDown) {
                         try {
+                            if (pointsTcpListener == null || isShuttingDown) break;
                             using (TcpClient client = await pointsTcpListener.AcceptTcpClientAsync())
                             using (NetworkStream stream = client.GetStream()) {
                                 byte[] dataToSend = null;
                                 lock (ghostLock) { dataToSend = currentGhostBinary; }
-                                if (dataToSend != null) {
+                                if (dataToSend == null) {
+                                    staticLogger?.LogInfo("[AI_DEBUG] Python connected to TCP port but ghost not ready yet. Triggering fetch now...");
+                                    TriggerGhostFetch();
+                                    for (int wait = 0; wait < 30; wait++) {
+                                        if (isShuttingDown) break;
+                                        await Task.Delay(200);
+                                        lock (ghostLock) { dataToSend = currentGhostBinary; }
+                                        if (dataToSend != null) break;
+                                    }
+                                }
+
+                                if (dataToSend != null && !isShuttingDown) {
                                     byte[] sizeBytes = BitConverter.GetBytes(dataToSend.Length);
                                     await stream.WriteAsync(sizeBytes, 0, 4);
                                     await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
-                                    Logger.LogInfo($"[AI_DEBUG] Sent {dataToSend.Length} bytes to Python via TCP.");
+                                    staticLogger?.LogInfo($"[AI_DEBUG] Sent {dataToSend.Length} bytes to Python via TCP.");
                                     ghostLoaded = true;
-                                } else { Logger.LogWarning("[AI_DEBUG] Python connected but no ghost data is ready yet."); }
+                                } else if (!isShuttingDown) {
+                                    staticLogger?.LogWarning("[AI_DEBUG] Python connected but ghost data could not be prepared.");
+                                }
                             }
+                        } catch (ObjectDisposedException) {
+                            break;
                         } catch (Exception ex) {
-                            Logger.LogError($"[AI_DEBUG] TCP Server Loop Error: {ex.Message}");
+                            if (isShuttingDown) break;
+                            staticLogger?.LogError($"[AI_DEBUG] TCP Server Loop Error: {ex.Message}");
                             await Task.Delay(1000);
                         }
                     }
@@ -409,7 +474,7 @@ namespace Zeepkist.Ai
 
         private static bool IsAiActive()
         {
-            return EnableAi.Value && (DateTime.Now - lastInputTime).TotalMilliseconds <= 500;
+            return EnableAi.Value && (DateTime.Now - lastInputTime).TotalSeconds <= 10.0;
         }
 
         private void OnGUI()
@@ -417,43 +482,47 @@ namespace Zeepkist.Ai
             if (!EnableAi.Value) return;
 
             GUI.color = Color.white;
-            GUI.Box(new Rect(10, 10, 270, 110), "=== Zeepkist AI HUD ===");
+            GUI.Box(new Rect(10, 10, 270, 130), "=== Zeepkist AI HUD ===");
             
             bool active = IsAiActive();
             GUI.Label(new Rect(20, 30, 250, 20), $"Status: {(active ? "<color=green>AI ACTIVE</color>" : "<color=yellow>STANDBY / MANUAL</color>")}");
             GUI.Label(new Rect(20, 50, 250, 20), $"Speed: {Time.timeScale:F1}x | Track: {currentLevelHash}");
             
+            float displayReward = isRewardFrozen ? lastFrozenReward : (CurrentInput != null ? CurrentInput.Reward : 0f);
+            string rewardColor = displayReward >= 0 ? "<color=#00FF66>" : "<color=#FF4444>";
+            string rewardLabel = isRewardFrozen ? "Reward (FINAL)" : "Reward";
+            GUI.Label(new Rect(20, 70, 250, 20), $"{rewardLabel}: {rewardColor}{displayReward:+0.0;-0.0;0.0}</color>");
+
             float steer = CurrentInput != null ? CurrentInput.Steering : 0f;
             float brake = CurrentInput != null ? CurrentInput.Brake : 0f;
             float arms = CurrentInput != null ? CurrentInput.ArmsUp : 0f;
             
-            GUI.Label(new Rect(20, 70, 250, 20), $"Steer: {steer:+0.00;-0.00; 0.00} | Brake: {brake:F2} | Arms: {arms:F2}");
+            GUI.Label(new Rect(20, 90, 250, 20), $"Steer: {steer:+0.00;-0.00; 0.00} | Brake: {brake:F2} | Arms: {arms:F2}");
 
             int barLen = 18;
             int steerPos = Mathf.Clamp((int)((steer + 1f) * 0.5f * barLen), 0, barLen);
             char[] bar = new string('-', barLen).ToCharArray();
             bar[barLen / 2] = '|';
             bar[steerPos] = 'O';
-            GUI.Label(new Rect(20, 88, 250, 20), $"[{new string(bar)}]");
+            GUI.Label(new Rect(20, 108, 250, 20), $"[{new string(bar)}]");
         }
 
         private static void InputReceiverLoop()
         {
             IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, InputPort.Value);
-            staticLogger.LogInfo($"[AI_DEBUG] Dedicated Input Receiver Thread started on port {InputPort.Value}");
+            staticLogger?.LogInfo($"[AI_DEBUG] Dedicated Input Receiver Thread started on port {InputPort.Value}");
             
-            while (true)
+            while (!isShuttingDown)
             {
                 try
                 {
-                    if (inputServer == null)
+                    if (inputServer == null || isShuttingDown)
                     {
-                        Thread.Sleep(100);
-                        continue;
+                        break;
                     }
                     
                     byte[] bytes = inputServer.Receive(ref remoteEP);
-                    if (bytes != null && bytes.Length >= 18)
+                    if (bytes != null && bytes.Length >= 18 && !isShuttingDown)
                     {
                         lastInputTime = DateTime.Now;
                         using (MemoryStream ms = new MemoryStream(bytes))
@@ -473,10 +542,15 @@ namespace Zeepkist.Ai
                             CurrentInput.RequestGhost = reqGhost;
                             CurrentInput.SpawnIndex = spawnIdx;
                             
+                            if (reqGhost && !isShuttingDown)
+                            {
+                                TriggerGhostFetch();
+                            }
+                            
                             inputPacketCount++;
                             if (inputPacketCount % 500 == 0)
                             {
-                                staticLogger.LogInfo($"[AI_DEBUG] Recv Input: Steer={steer:F2}, Brake={brake:F2}, Arms={arms:F2}, SpawnIndex={spawnIdx}");
+                                staticLogger?.LogInfo($"[AI_DEBUG] Recv Input: Steer={steer:F2}, Brake={brake:F2}, Arms={arms:F2}, SpawnIndex={spawnIdx}");
                             }
 
                             if (bytes.Length > 18)
@@ -487,26 +561,32 @@ namespace Zeepkist.Ai
                                 {
                                     lock (targetLock) { latestTargetPositions = data.p; }
                                     CurrentInput.TrainingTime = data.t;
+                                    if (!isRewardFrozen)
+                                    {
+                                        CurrentInput.Reward = data.rew;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
                 catch (SocketException ex)
                 {
-                    if (ex.SocketErrorCode == SocketError.Interrupted || ex.SocketErrorCode == SocketError.ConnectionReset)
+                    if (isShuttingDown || ex.SocketErrorCode == SocketError.Interrupted || ex.SocketErrorCode == SocketError.ConnectionReset)
                     {
-                        // UDP port unreachable/closed, ignore
+                        break;
                     }
-                    else
-                    {
-                        staticLogger.LogError($"[AI_DEBUG] Input Socket Exception: {ex.Message}");
-                        Thread.Sleep(100);
-                    }
+                    staticLogger?.LogError($"[AI_DEBUG] Input Socket Exception: {ex.Message}");
+                    Thread.Sleep(100);
                 }
                 catch (Exception ex)
                 {
-                    staticLogger.LogError($"[AI_DEBUG] Input Receiver Thread error: {ex.Message}");
+                    if (isShuttingDown) break;
+                    staticLogger?.LogError($"[AI_DEBUG] Input Receiver Thread error: {ex.Message}");
                     Thread.Sleep(100);
                 }
             }
@@ -551,23 +631,26 @@ namespace Zeepkist.Ai
                 Time.timeScale = GameSpeed.Value;
             }
 
-            // Heartbeat: If Python pauses (training), hold last steering but don't reset.
-            bool isPaused = (DateTime.Now - lastInputTime).TotalMilliseconds > 500;
+            // Heartbeat: If Python disconnects (>10s), pause reset commands
+            bool isPaused = (DateTime.Now - lastInputTime).TotalSeconds > 10.0;
 
             if (CurrentInput != null && CurrentInput.Reset && !isPaused) {
                 if (PlayerManager.Instance?.currentMaster != null) {
-                    pendingSpawnIndex = CurrentInput.SpawnIndex;
                     PlayerManager.Instance.currentMaster.RestartLevel();
                     CurrentInput.Reset = false; playerCar = null; isRoundActive = false;
                 }
             }
 
-            // Self-healing: Resolve playerCar if active but null
-            if (isRoundActive && (playerCar == null || playerCar.gameObject == null)) {
+            // Self-healing: Resolve playerCar if null or destroyed
+            if (playerCar == null || playerCar.gameObject == null) {
                 try {
                     if (PlayerManager.Instance?.currentMaster?.carSetups != null && PlayerManager.Instance.currentMaster.carSetups.Count > 0) {
-                        playerCar = PlayerManager.Instance.currentMaster.carSetups.First().cc;
-                        staticLogger.LogInfo("[AI_DEBUG] FixedUpdate self-healed: Resolved playerCar successfully.");
+                        var firstCc = PlayerManager.Instance.currentMaster.carSetups.First()?.cc;
+                        if (firstCc != null && firstCc.gameObject != null && firstCc.rb != null) {
+                            playerCar = firstCc;
+                            isRoundActive = true;
+                            isRewardFrozen = false;
+                        }
                     }
                 } catch { }
             }
@@ -664,9 +747,7 @@ namespace Zeepkist.Ai
                         writer.Write(currentLevelHash); writer.Write(lastResetReason);
                     }
                     byte[] bytes = ms.ToArray();
-                    Task.Run(() => {
-                        try { telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint); } catch { }
-                    });
+                    try { telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint); } catch { }
                 }
             } catch { }
         }
@@ -762,7 +843,7 @@ namespace Zeepkist.Ai
             } catch { }
         }
 
-        public void PrepareGhostBinary(List<GhostFrame> frames, string levelHash)
+        public static void PrepareGhostBinary(List<GhostFrame> frames, string levelHash)
         {
             // Send every 5th frame for precision in loops
             List<object> data_frames = new List<object>();
@@ -781,7 +862,21 @@ namespace Zeepkist.Ai
             lock (ghostLock) { currentGhostBinary = bytes; ghostReady = true; }
         }
 
-        public void OnDestroy() { harmony?.UnpatchSelf(); inputServer?.Close(); telemetryClient?.Close(); pointsTcpListener?.Stop(); }
+        private void OnApplicationQuit()
+        {
+            isShuttingDown = true;
+            try { inputServer?.Close(); } catch { }
+            try { telemetryClient?.Close(); } catch { }
+            try { pointsTcpListener?.Stop(); } catch { }
+        }
+
+        public void OnDestroy()
+        {
+            isShuttingDown = true;
+            try { inputServer?.Close(); } catch { }
+            try { telemetryClient?.Close(); } catch { }
+            try { pointsTcpListener?.Stop(); } catch { }
+        }
 
         // =========================================================================
         // DIRECT INPUT PREFIX PATCHES (Bulletproof steering, braking, and arms-up)
@@ -862,7 +957,7 @@ namespace Zeepkist.Ai
 
         [HarmonyPatch(typeof(Instellingen), "ApplyGraphicsSettings")]
         public static class Instellingen_ApplyGraphicsSettings_Patch {
-            public static bool Prefix(bool force) {
+            public static bool Prefix(bool resolutionChanged) {
                 string[] args = Environment.GetCommandLineArgs();
                 if (winPosX >= 0 || args.Any(a => a.Equals("-aiPortOffset", StringComparison.OrdinalIgnoreCase) || a.Equals("-windowed", StringComparison.OrdinalIgnoreCase))) {
                     Screen.SetResolution(winWidth, winHeight, FullScreenMode.Windowed);
@@ -871,9 +966,18 @@ namespace Zeepkist.Ai
                 return true;
             }
         }
+
+        [HarmonyPatch(typeof(PressAnyKeyToStartGame), "Start")]
+        public static class PressAnyKeyToStartGame_Start_Patch {
+            public static void Postfix(PressAnyKeyToStartGame __instance) {
+                Plugin.staticLogger?.LogInfo($"[AI_AUTO] PressAnyKeyToStartGame detected! Loading target scene immediately...");
+                string target = string.IsNullOrEmpty(__instance.nextLevel) ? "3D_MainMenu" : __instance.nextLevel;
+                SceneManager.LoadScene(target);
+            }
+        }
     }
 
-    public class JsonInputData { public float[][] p; public float t; }
+    public class JsonInputData { public float[][] p; public float t; public float rew; }
 
     public class UnityMainThreadDispatcher : MonoBehaviour {
         private static readonly Queue<Action> _executionQueue = new Queue<Action>();
@@ -966,6 +1070,6 @@ namespace Zeepkist.Ai
     public class AiInput {
         public float Steering; public float Brake; public float ArmsUp; public bool Reset; public bool RequestGhost;
         public int SpawnIndex;
-        public float[][] TargetPositions; public float TrainingTime;
+        public float[][] TargetPositions; public float TrainingTime; public float Reward;
     }
 }

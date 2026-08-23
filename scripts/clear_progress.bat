@@ -2,11 +2,15 @@
 setlocal
 
 set SCRIPTS_DIR=%~dp0
+set PYTHON_DIR=%SCRIPTS_DIR%python\
 set MODEL_FILE=%SCRIPTS_DIR%zeepkist_ai_model.zip
+set MODEL_FILE2=%PYTHON_DIR%zeepkist_ai_model.zip
 set STATS_FILE=%SCRIPTS_DIR%zeepkist_vec_normalize.pkl
+set STATS_FILE2=%PYTHON_DIR%zeepkist_vec_normalize.pkl
 set LOG_DIR=%SCRIPTS_DIR%zeepkist_logs
 set CHECKPOINT_DIR=%SCRIPTS_DIR%checkpoints
 set TIME_FILE=%SCRIPTS_DIR%zeepkist_total_time.txt
+set TIME_FILE2=%PYTHON_DIR%zeepkist_total_time.txt
 set TRAIN_LOG=%SCRIPTS_DIR%zeepkist_training.log
 
 echo === Zeepkist AI Progress Reset ===
@@ -28,6 +32,11 @@ if exist "%MODEL_FILE%" (
     )
 ) else (
     echo [SKIP] Model file not found.
+)
+
+if exist "%MODEL_FILE2%" (
+    echo Deleting: %MODEL_FILE2%
+    del /f /q /a "%MODEL_FILE2%"
 )
 
 if exist "%STATS_FILE%" (

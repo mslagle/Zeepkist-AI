@@ -10,7 +10,34 @@ PORT = 8080
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILEPATH = os.path.join(SCRIPT_DIR, "zeepkist_training.log")
 
-def parse_logs(log_filepath):
+def get_log_file():
+    candidates = [
+        os.path.join(SCRIPT_DIR, "zeepkist_training.log"),
+        os.path.join(SCRIPT_DIR, "..", "zeepkist_training.log"),
+        os.path.join(SCRIPT_DIR, "..", "..", "zeepkist_training.log"),
+        "zeepkist_training.log"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return os.path.join(SCRIPT_DIR, "zeepkist_training.log")
+
+def get_time_file():
+    candidates = [
+        os.path.join(SCRIPT_DIR, "zeepkist_total_time.txt"),
+        os.path.join(SCRIPT_DIR, "..", "zeepkist_total_time.txt"),
+        os.path.join(SCRIPT_DIR, "..", "..", "zeepkist_total_time.txt"),
+        "zeepkist_total_time.txt"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return os.path.join(SCRIPT_DIR, "zeepkist_total_time.txt")
+
+def parse_logs(log_filepath=None):
+    if log_filepath is None or not os.path.exists(log_filepath):
+        log_filepath = get_log_file()
+        
     history = []
     current_entry = {}
     recent_resets = []
@@ -18,7 +45,7 @@ def parse_logs(log_filepath):
     total_training_time = 0.0
     
     # Try reading the last saved time as starting point
-    time_filepath = os.path.join(SCRIPT_DIR, "zeepkist_total_time.txt")
+    time_filepath = get_time_file()
     if os.path.exists(time_filepath):
         try:
             with open(time_filepath, "r") as tf:

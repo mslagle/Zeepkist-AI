@@ -5,7 +5,28 @@ import socket
 import json
 import time
 import os
+import re
 import struct
+
+def append_training_log(msg):
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(script_dir, "zeepkist_training.log"), "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+def json_numpy_default(obj):
+    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 class ZeepkistEnv(gym.Env):
     def __init__(self, telemetry_port=9090, input_port=9091, points_port=9092, host='127.0.0.1', use_curriculum=False, instance_id=None):
@@ -32,29 +53,15 @@ class ZeepkistEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation Space: 48 dimensions (Physics-Aware)
-        # 0-2: Local Velocity
-        # 3-5: Local Angular Velocity
-        # 6: Speed
-        # 7-9: Relative Ghost Position (Local)
-        # 10-13: Relative Ghost Rotation (Local Quaternion)
-        # 14: Ghost Speed
-        # 15-16: Ghost Flags (ArmsUp, Braking)
-        # 17-19: Local Ground Normal
-        # 20-22: Local Next Checkpoint Direction
-        # 23-35: Raycasts (13 distances)
-        # 36-38: Lookahead 1 (+50 frames, Rel Pos Local)
-        # 39-41: Lookahead 2 (+100 frames, Rel Pos Local)
-        # 42: Previous Steering Action
-        # 43: Is Slipping (Binary)
-        # 44: Surface Friction
-        # 45: Progress (0.0 to 1.0)
-        # 46: Ghost Loaded (Binary)
-        # 47: Groundedness (Derived from rays/friction)
+        # Observation space: 35 Continuous values
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(35,), dtype=np.float32)
 
         # Network setup
         self.telemetry_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.telemetry_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except Exception:
+            pass
         self.telemetry_socket.bind((self.host, self.telemetry_port))
         self.telemetry_socket.settimeout(0.5) 
 
@@ -77,7 +84,8 @@ class ZeepkistEnv(gym.Env):
         self.initial_unity_time = None
         self.current_unity_time = 0.0
         self.start_session_time = time.time()
-        self.time_file = "zeepkist_total_time.txt"
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.time_file = os.path.join(script_dir, "zeepkist_total_time.txt")
         self.accumulated_time = 0.0
         if os.path.exists(self.time_file):
             try:
@@ -85,6 +93,11 @@ class ZeepkistEnv(gym.Env):
                     self.accumulated_time = float(f.read().strip())
                 print(f"Loaded cumulative training time: {self.accumulated_time:.1f}s")
             except: pass
+
+        # Run Recording System (Stores all runs in same JSON schema as ghosts for replay)
+        self.runs_dir = os.path.join(script_dir, "runs")
+        os.makedirs(self.runs_dir, exist_ok=True)
+        self.current_episode_frames = []
 
         if not os.path.exists("ghosts"):
             os.makedirs("ghosts")
@@ -111,10 +124,12 @@ class ZeepkistEnv(gym.Env):
                 payload = b"".join(chunks).decode('utf-8')
                 msg = json.loads(payload)
                 
-                if msg.get("LevelHash") != expected_hash: return False
+                if expected_hash and msg.get("LevelHash") != expected_hash:
+                    print(f"TCP Ghost hash mismatch: received {msg.get('LevelHash')}, expected {expected_hash}")
+                    return False
                 
                 self.ghost_frames = msg.get("Frames", [])
-                print(f"Successfully received {len(self.ghost_frames)} rich ghost frames.")
+                print(f"Successfully received {len(self.ghost_frames)} rich ghost frames (Level: {msg.get('LevelHash')}).")
                 return True
         except Exception as e:
             print(f"TCP Ghost Error: {e}")
@@ -230,10 +245,11 @@ class ZeepkistEnv(gym.Env):
         progress = 0.0
         
         self.fallen_off = False
+        self.veered_off = False
         if self.ghost_frames:
-            # Find nearest point (with 500-frame forward window to prevent U-turns)
-            search_start = self.last_ghost_index
-            search_end = min(len(self.ghost_frames), search_start + 500)
+            # Generous forward search window (100 frames ~ 2.0s) so high speed does not clamp
+            search_start = max(0, self.last_ghost_index - 10)
+            search_end = min(len(self.ghost_frames), self.last_ghost_index + 100)
             subset = self.ghost_frames[search_start:search_end]
             
             if len(subset) > 0:
@@ -242,34 +258,55 @@ class ZeepkistEnv(gym.Env):
                 best_local = np.argmin(dists)
                 self.last_ghost_index = search_start + best_local
             else:
-                # Fallback to full search if lost
-                pos_array = np.array([f['p'] for f in self.ghost_frames])
+                # Fallback search
+                search_start_back = max(0, self.last_ghost_index - 20)
+                search_end_fwd = min(len(self.ghost_frames), self.last_ghost_index + 120)
+                pos_array = np.array([f['p'] for f in self.ghost_frames[search_start_back:search_end_fwd]])
                 dists = np.sum((pos_array - car_pos)**2, axis=1)
-                self.last_ghost_index = np.argmin(dists)
+                self.last_ghost_index = search_start_back + np.argmin(dists)
 
             gf = self.ghost_frames[self.last_ghost_index]
-            self.fallen_off = (gf['p'][1] - car_pos[1]) > 15.0
+            dist_to_line = np.linalg.norm(np.array(gf['p']) - car_pos)
+            
+            # Failure Conditions: Only check veering after starting grid warmup (step > 30)
+            if self.steps_in_episode > 30 and self.last_ghost_index > 5:
+                self.veered_off = dist_to_line > 15.0
+                self.fallen_off = (gf['p'][1] - car_pos[1]) > 15.0 or self.veered_off
+            else:
+                self.veered_off = False
+                self.fallen_off = False
+            
             rel_ghost_pos = self._rotate_to_local(gf['p'] - car_pos, car_quat)
             # Relative Rotation (Ghost Quat * Inverse Car Quat)
             rel_ghost_rot = self._relative_quaternion(car_quat, gf['r'])
             ghost_speed = gf['s']
             ghost_flags = [1.0 if gf['a'] else 0.0, 1.0 if gf['b'] else 0.0]
             
-            # Lookaheads
-            lh1_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 30) # ~1.5s ahead
-            lh2_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 60) # ~3.0s ahead
+            # Lookaheads (Responsive short ~0.25s and medium ~0.6s)
+            lh1_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 12)
+            lh2_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 30)
             lookahead1 = self._rotate_to_local(np.array(self.ghost_frames[lh1_idx]['p']) - car_pos, car_quat)
             lookahead2 = self._rotate_to_local(np.array(self.ghost_frames[lh2_idx]['p']) - car_pos, car_quat)
+
+            # Road tangent direction along the track spline (curve guidance)
+            tangent_world = np.array(self.ghost_frames[lh1_idx]['p']) - np.array(gf['p'])
+            tangent_norm = np.linalg.norm(tangent_world)
+            if tangent_norm > 1e-3:
+                track_dir_world = tangent_world / tangent_norm
+            else:
+                track_dir_world = np.array([0.0, 0.0, 1.0])
+            track_dir_local = self._rotate_to_local(track_dir_world, car_quat)
             progress = self.last_ghost_index / len(self.ghost_frames)
+        else:
+            track_dir_local = self._rotate_to_local([t['CPDir']['x'], t['CPDir']['y'], t['CPDir']['z']], car_quat)
 
         # 3. Environment Sensors
         ground_normal_local = self._rotate_to_local([t['GroundNormal']['x'], t['GroundNormal']['y'], t['GroundNormal']['z']], car_quat)
-        cp_dir_local = self._rotate_to_local([t['CPDir']['x'], t['CPDir']['y'], t['CPDir']['z']], car_quat)
         
         obs = np.concatenate([
             vel_local, ang_vel_local, [t['Speed']],
             rel_ghost_pos, rel_ghost_rot, [ghost_speed], ghost_flags,
-            ground_normal_local, cp_dir_local,
+            ground_normal_local, track_dir_local,
             lookahead1, lookahead2,
             [self.last_steering], [1.0 if t['IsSlipping'] else 0.0], [t['SurfaceFriction']],
             [progress], [1.0 if self.ghost_frames else 0.0],
@@ -287,55 +324,59 @@ class ZeepkistEnv(gym.Env):
         is_grounded = obs[34] > 0.5
         ghost_is_braking = obs[16] > 0.5
         
-        reward = 0.0
-        
-        # 0. CHECKPOINT BONUS (Mandatory for completion)
-        if self.last_telemetry.get('CheckpointReached', False):
-            reward += 500.0
-            print(f"[REWARD] Checkpoint reached! +500")
+        # 0. TIME COST (Small step penalty so faster completion times earn higher cumulative return)
+        reward = -0.05
 
-        # 1. PROGRESS REWARD (Primary)
+        # 1. CHECKPOINTS (+1,000)
+        if self.last_telemetry.get('CheckpointReached', False):
+            reward += 1000.0
+            print(f"[REWARD] Checkpoint reached! +1000")
+
+        # 2. DISTANCE / TRACK PROGRESS (+25 per new waypoint along median ghost spline)
         if self.last_ghost_index > self.max_ghost_index:
-            reward += (self.last_ghost_index - self.max_ghost_index) * 5.0
+            new_waypoints = self.last_ghost_index - self.max_ghost_index
+            reward += new_waypoints * 25.0
             self.max_ghost_index = self.last_ghost_index
         
-        # 2. SPEED ON PATH (Primary continuous reward: speed in direction of path * path adherence)
+        # 3. SPEED & LINE FOLLOWING (Rewards matching and exceeding ghost speed on the line)
         dist_to_path = np.linalg.norm(rel_ghost_pos)
-        speed_on_path = vel_local[2] * np.exp(-dist_to_path * 0.3)
-        reward += speed_on_path * 0.5
-        
-        # 4. MOMENTUM CONSERVATION (Smooth steering)
-        steering = action[0]
-        reward -= abs(steering) * (speed / 100.0) * 0.05
-        
-        # 5. SWERVING PENALTY
-        steering_change = abs(steering - self.last_steering)
-        reward -= (steering_change ** 2) * 2.0
-        self.last_steering = steering
-        
-        # 6. LANDING / ORIENTATION ALIGNMENT
-        ground_normal = obs[17:20]
-        car_up = np.array([0, 1, 0])
-        alignment = np.dot(ground_normal, car_up)
-        reward += alignment * 0.1
+        track_dir_local = obs[20:23]
+        road_heading_alignment = max(0.0, float(track_dir_local[2]))
+        target_ghost_speed = max(10.0, float(obs[14]))
 
-        # 7. BRAKING PENALTY
+        # Line accuracy factor (1.0 right on centerline, decays as car drifts)
+        on_line_factor = road_heading_alignment * np.exp(-dist_to_path * 0.4)
+        
+        # Speed ratio: current speed vs. recorded median ghost speed
+        speed_ratio = speed / target_ghost_speed
+
+        # Scaled reward: matching speed gives +2.0, exceeding ghost speed gives accelerated bonus!
+        if speed_ratio >= 1.0:
+            speed_reward = 2.0 + (speed_ratio - 1.0) * 3.0  # High bonus for exceeding human speed
+        else:
+            speed_reward = speed_ratio * 2.0  # Proportional ramp-up as speed approaches ghost
+
+        reward += speed_reward * on_line_factor
+
+        # Off-line penalty (if drifting > 3.0m away from the line)
+        if dist_to_path > 3.0:
+            reward -= (dist_to_path - 3.0) * 0.5
+        
+        # 4. MOMENTUM CONSERVATION & SMOOTHNESS
+        steering = action[0]
+        reward -= abs(steering) * (speed / 100.0) * 0.03
+        
+        steering_change = abs(steering - self.last_steering)
+        reward -= (steering_change ** 2) * 1.0
+        self.last_steering = steering
+
+        # 5. BRAKING PENALTY (Discourage unnecessary braking on open track)
         brake_input = action[1]
         if brake_input > 0.01:
-            if is_grounded:
-                if not ghost_is_braking:
-                    reward -= brake_input * 5.0
-                else:
-                    reward -= brake_input * 0.1
+            if is_grounded and not ghost_is_braking:
+                reward -= brake_input * 3.0
             else:
-                ang_vel_mag = np.linalg.norm(obs[3:6])
-                spin_factor = max(0.0, 1.0 - ang_vel_mag / 1.0)
-                reward -= brake_input * spin_factor * 1.0
-
-        # 7.5 AIR SPIN PENALTY
-        if not is_grounded:
-            ang_vel_mag = np.linalg.norm(obs[3:6])
-            reward -= ang_vel_mag * 0.05
+                reward -= brake_input * 0.05
 
         return reward
 
@@ -354,6 +395,18 @@ class ZeepkistEnv(gym.Env):
         if not self._receive_telemetry():
             return self._get_obs(), 0.0, False, False, {}
 
+        # Capture telemetry frame for run replay recording
+        t = self.last_telemetry
+        if t and t.get('IsSpawned', False):
+            self.current_episode_frames.append({
+                'p': [round(float(t['Position']['x']), 3), round(float(t['Position']['y']), 3), round(float(t['Position']['z']), 3)],
+                'r': [round(float(t['Rotation']['x']), 4), round(float(t['Rotation']['y']), 4), round(float(t['Rotation']['z']), 4), round(float(t['Rotation']['w']), 4)],
+                's': round(float(t['Speed']), 2),
+                'a': round(float(action[2]), 2),
+                'b': round(float(action[1]), 2),
+                'steer': round(float(action[0]), 2)
+            })
+
         obs = self._get_obs()
         reward = self._calculate_reward(obs, action)
         self.episode_reward += reward
@@ -361,14 +414,20 @@ class ZeepkistEnv(gym.Env):
         if self.last_ghost_index > self.global_max_ghost_index:
             self.global_max_ghost_index = self.last_ghost_index
         
-        # Stuck Detection
+        # Stuck / Slow Crawl Detection (Only check after warmup period: steps > 80 ~1.6s)
         speed = obs[6]
         terminated = False
-        if speed < 1.0:
+        termination_reason = "None"
+        if self.steps_in_episode > 80 and speed < 5.0:
             if self.stuck_start_time is None:
                 self.stuck_start_time = time.time()
-            elif time.time() - self.stuck_start_time > 5.0:
-                print(f"[RESET] Reason: Stuck (Speed < 1.0 for 5s) | Ep Reward: {self.episode_reward:.2f}")
+            elif time.time() - self.stuck_start_time > 8.0:
+                termination_reason = "Stuck (Speed < 5.0 for 8s)"
+                reward -= 150.0
+                self.episode_reward += (-150.0)
+                msg = f"[RESET] Reason: {termination_reason} | Final Reward: {self.episode_reward:.2f}"
+                print(msg)
+                append_training_log(msg)
                 terminated = True
         else:
             self.stuck_start_time = None
@@ -380,47 +439,90 @@ class ZeepkistEnv(gym.Env):
             if self.initial_unity_time is not None:
                 session_delta = self.current_unity_time - self.initial_unity_time
             total_time = self.accumulated_time + session_delta
-            print(f"[STATUS] Time: {int(total_time)}s | Ep Steps: {self.steps_in_episode} | Ep Reward: {self.episode_reward:.2f}")
+            msg = f"[STATUS] Time: {int(total_time)}s | Ep Steps: {self.steps_in_episode} | Ep Reward: {self.episode_reward:.2f}"
+            print(msg)
+            append_training_log(msg)
             self.last_log_time = now
 
         # Terminal conditions
         if not terminated:
             if getattr(self, 'fallen_off', False):
-                print(f"[RESET] Reason: Fell off track (>15m below ghost) | Ep Reward: {self.episode_reward:.2f}")
-                reward -= 100.0
+                termination_reason = "Veered off track (>15m from line)" if getattr(self, 'veered_off', False) else "Fell off track (>15m below line)"
+                reward -= 150.0
+                self.episode_reward += (-150.0)
+                msg = f"[RESET] Reason: {termination_reason} | Final Reward: {self.episode_reward:.2f}"
+                print(msg)
+                append_training_log(msg)
                 terminated = True
             elif not self.last_telemetry.get('IsSpawned', False):
-                reason = self.last_telemetry.get('ResetReason', 'Unknown')
-                print(f"[RESET] Reason: {reason} | Ep Reward: {self.episode_reward:.2f}")
-                if reason == "Finished": reward += 1000.0
-                else: reward -= 100.0
+                termination_reason = self.last_telemetry.get('ResetReason', 'Unknown')
+                terminal_bonus = 5000.0 if termination_reason == "Finished" else -150.0
+                reward += terminal_bonus
+                self.episode_reward += terminal_bonus
+                msg = f"[RESET] Reason: {termination_reason} | Final Reward: {self.episode_reward:.2f}"
+                print(msg)
+                append_training_log(msg)
                 terminated = True
                 
             if self.steps_in_episode > 15000: 
-                print(f"[RESET] Reason: Step Limit Reached | Ep Reward: {self.episode_reward:.2f}")
+                termination_reason = "Step Limit Reached"
+                msg = f"[RESET] Reason: {termination_reason} | Final Reward: {self.episode_reward:.2f}"
+                print(msg)
+                append_training_log(msg)
                 terminated = True
+
+        if terminated:
+            self._save_episode_run(termination_reason)
         
         return obs, reward, terminated, False, {}
+
+    def _save_episode_run(self, reason):
+        """Saves completed episode trajectory in standard ghost JSON format for replay."""
+        if not self.current_episode_frames or len(self.current_episode_frames) < 15:
+            self.current_episode_frames = []
+            return
+            
+        level_hash = self.current_level_hash or "UnknownLevel"
+        track_runs_dir = os.path.join(self.runs_dir, level_hash)
+        os.makedirs(track_runs_dir, exist_ok=True)
+        
+        timestamp = int(time.time())
+        safe_reason = re.sub(r'[^a-zA-Z0-9_-]', '_', reason)[:20]
+        filename = f"run_{timestamp}_inst{self.instance_id}_rew{int(self.episode_reward)}_{safe_reason}.json"
+        filepath = os.path.join(track_runs_dir, filename)
+        
+        data = {
+            "LevelHash": str(level_hash),
+            "FrameCount": int(len(self.current_episode_frames)),
+            "EpisodeReward": round(float(self.episode_reward), 2),
+            "EpisodeSteps": int(self.steps_in_episode),
+            "TerminationReason": str(reason),
+            "FurthestGhostIndex": int(self.last_ghost_index),
+            "Frames": self.current_episode_frames
+        }
+        
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, default=json_numpy_default)
+        except Exception as e:
+            print(f"Error saving run recording: {e}")
+            
+        self.current_episode_frames = []
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.steps_in_episode = 0
         
-        # Sample spawn index using Curriculum Learning
+        # Always spawn at standard starting grid
         spawn_index = -1
-        if self.use_curriculum and self.ghost_frames and getattr(self, 'global_max_ghost_index', 0) > 50:
-            if np.random.rand() < 0.5:
-                max_start = min(len(self.ghost_frames) - 20, int(self.global_max_ghost_index - 30))
-                if max_start > 0:
-                    spawn_index = int(np.random.randint(1, max_start))
-                    
-        self.last_ghost_index = max(0, spawn_index)
-        self.max_ghost_index = max(0, spawn_index)
+        self.last_ghost_index = 0
+        self.max_ghost_index = 0
         self.last_steering = 0.0
         self.episode_reward = 0.0
         self.stuck_start_time = None
+        self.current_episode_frames = []
         
-        print(f"\n--- NEW RACE STARTING (Spawn Index: {max(0, spawn_index)} / Furthest: {self.global_max_ghost_index}) ---")
+        print(f"\n--- NEW RACE STARTING (Starting Grid | Furthest: {self.global_max_ghost_index}) ---")
         self._send_input(0.0, 0.0, 0.0, reset=True, spawn_index=spawn_index)
         
         # 1. Wait for IsSpawned to become False (ensure reset processed)
@@ -465,15 +567,14 @@ class ZeepkistEnv(gym.Env):
 
     def save_time(self):
         """Persists total cumulative training time to disk."""
-        session_delta = 0.0
-        if self.initial_unity_time is not None:
-            session_delta = self.current_unity_time - self.initial_unity_time
-        total = self.accumulated_time + session_delta
-        try:
-            with open(self.time_file, "w") as f:
-                f.write(str(total))
-        except Exception as e:
-            print(f"Error saving time file: {e}")
+        if self.instance_id == 0:
+            session_delta = max(0.0, time.time() - self.start_session_time)
+            total = self.accumulated_time + session_delta
+            try:
+                with open(self.time_file, "w") as f:
+                    f.write(f"{total:.1f}")
+            except Exception as e:
+                print(f"Error saving time file: {e}")
 
     def close(self):
         self.save_time()
@@ -488,7 +589,11 @@ class ZeepkistEnv(gym.Env):
             session_delta = self.current_unity_time - self.initial_unity_time
             
         total_time = self.accumulated_time + session_delta
-        input_data = {"p": [[0,0,0]]*4, "t": round(total_time, 1)}
-        msg = header + json.dumps(input_data).encode('utf-8')
+        input_data = {
+            "p": [[0,0,0]]*4,
+            "t": round(float(total_time), 1),
+            "rew": round(float(self.episode_reward), 1)
+        }
+        msg = header + json.dumps(input_data, default=json_numpy_default).encode('utf-8')
         try: self.input_socket.sendto(msg, (self.host, self.input_port))
         except Exception: pass

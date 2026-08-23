@@ -401,3 +401,7 @@ zeepkist_checkpoints/*.zip
 scripts/ghosts/
 scripts/checkpoints/*.zip
 scripts/checkpoints/
+scripts/python/checkpoints/*.zip
+scripts/python/runs/**/*.json
+scripts/zeepkist_total_time.txt
+scripts/python/zeepkist_total_time.txt

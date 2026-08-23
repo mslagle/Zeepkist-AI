@@ -18,7 +18,7 @@ if exist "%VENV_DIR%" (
 
 :: 2. Run the stats server script
 echo Starting Telemetry Dashboard Server...
-python "%SCRIPT_DIR%stats_server.py"
+python "%SCRIPT_DIR%python\stats_server.py"
 
 :: 3. Keep window open if script exits
 echo.

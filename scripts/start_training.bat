@@ -27,7 +27,7 @@ call "%VENV_DIR%\Scripts\activate"
 echo Installing/Updating requirements...
 :: Force older setuptools (<70) for TensorBoard's pkg_resources compatibility
 pip install --upgrade "setuptools<70" pip grpcio tensorboard-data-server
-pip install -r requirements.txt
+pip install -r "%SCRIPT_DIR%python\requirements.txt"
 if %errorlevel% neq 0 (
     echo Error: Failed to install requirements.
     pause
@@ -35,8 +35,16 @@ if %errorlevel% neq 0 (
 )
 
 :: 4. Run the training script
-echo Starting training...
-python train.py
+echo.
+if "%~1"=="" (
+    set /p INSTANCES_COUNT="Enter number of game instances to train [default 2]: "
+    if "%INSTANCES_COUNT%"=="" set INSTANCES_COUNT=2
+    echo Starting parallel training across %INSTANCES_COUNT% instances...
+    python "%SCRIPT_DIR%python\train.py" --instances %INSTANCES_COUNT%
+) else (
+    echo Starting training with arguments: %*
+    python "%SCRIPT_DIR%python\train.py" %*
+)
 
 :: 5. Keep window open if script exits
 echo.

@@ -10,66 +10,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from stable_baselines3.common.monitor import Monitor
 from zeep_env import ZeepkistEnv
 
-class CustomPPO(PPO):
-    def collect_rollouts(
-        self,
-        env: "VecEnv",
-        callback: "BaseCallback",
-        rollout_buffer: "RolloutBuffer",
-        n_rollout_steps: int,
-    ) -> bool:
-        # Restore absolute max size at the start of a new collection
-        rollout_buffer.buffer_size = n_rollout_steps
-
-        # If we forced a reset in the last update, perform the actual wait/reset now.
-        if self._last_obs is None:
-            self._last_obs = env.reset()
-
-        assert self._last_obs is not None, "No previous observation"
-        self.policy.set_training_mode(False)
-        n_steps = 0
-        rollout_buffer.reset()
-        callback.on_rollout_start()
-
-        while n_steps < n_rollout_steps:
-            with torch.no_grad():
-                obs_tensor = torch.as_tensor(self._last_obs).to(self.device)
-                actions, values, log_probs = self.policy(obs_tensor)
-            
-            new_obs, rewards, dones, infos = env.step(actions.cpu().numpy())
-            self.num_timesteps += env.num_envs
-            n_steps += 1
-            
-            self._update_info_buffer(infos, dones)
-            
-            rollout_buffer.add(self._last_obs, actions, rewards, dones, values, log_probs)
-            self._last_obs = new_obs
-
-            callback.update_child_locals(locals())
-            if callback.on_step() is False:
-                return False
-
-            # SYNC ON RESET: If car crashed/finished and we have enough data (min 2048), update now.
-            if dones[0] and n_steps >= 2048:
-                print(f"Episode ended (Step {n_steps}). Starting brain update during reset...")
-                # TRICK: Tell SB3 the buffer is full at this exact step count
-                rollout_buffer.buffer_size = n_steps
-                rollout_buffer.full = True
-                break
-        
-        # --- FORCE-SYNC RESET ---
-        # Tell the mod to restart the level NOW so it reloads while we optimize.
-        env.envs[0].unwrapped.force_mod_reset()
-        # Force the next rollout to call env.reset()
-        self._last_obs = None
-                
-        with torch.no_grad():
-            last_values = self.policy.predict_values(torch.as_tensor(new_obs).to(self.device))
-            
-        rollout_buffer.compute_returns_and_advantage(last_values, dones)
-        callback.on_rollout_end()
-        return True
-
+# Standard PPO with clean per-instance lifecycle and logging
+class ZeepkistPPO(PPO):
     def train(self) -> None:
         print("\n" + "-"*42)
         print("BRAIN UPDATE: Optimizing Neural Network...")
@@ -84,18 +26,60 @@ class Logger(object):
         self.log = open(filename, "a", encoding="utf-8")
     def write(self, message):
         self.terminal.write(message); self.log.write(message)
-        self.terminal.flush(); self.log.flush()
+        try:
+            self.terminal.flush(); self.log.flush()
+        except Exception:
+            pass
     def flush(self):
-        self.terminal.flush(); self.log.flush()
+        try:
+            self.terminal.flush(); self.log.flush()
+        except Exception:
+            pass
+
+from stable_baselines3.common.callbacks import BaseCallback
+
+class TelemetryDashboardCallback(BaseCallback):
+    def __init__(self, log_path, check_freq=100):
+        super().__init__()
+        self.log_path = log_path
+        self.check_freq = check_freq
+        self.start_time = time.time()
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq == 0:
+            ep_info_buf = getattr(self.model, 'ep_info_buffer', [])
+            ep_rew_mean = float(np.mean([ep_info['r'] for ep_info in ep_info_buf])) if len(ep_info_buf) > 0 else 0.0
+            ep_len_mean = float(np.mean([ep_info['l'] for ep_info in ep_info_buf])) if len(ep_info_buf) > 0 else 0.0
+            fps = int(self.num_timesteps / max(1e-3, (time.time() - self.start_time)))
+            elapsed = int(time.time() - self.start_time)
+            
+            block = (
+                "---------------------------------\n"
+                f"| time/              |          |\n"
+                f"|    fps             | {fps:<8} |\n"
+                f"|    time_elapsed    | {elapsed:<8} |\n"
+                f"|    total_timesteps | {self.num_timesteps:<8} |\n"
+                f"| rollout/           |          |\n"
+                f"|    ep_len_mean     | {ep_len_mean:<8.1f} |\n"
+                f"|    ep_rew_mean     | {ep_rew_mean:<8.2f} |\n"
+                "---------------------------------\n"
+            )
+            try:
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(block)
+                    f.flush()
+            except Exception:
+                pass
+        return True
 
 import argparse
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
-USE_CURRICULUM = False # Set to False to disable mid-race restarts (curriculum learning)
+USE_CURRICULUM = False # Spawns always at starting grid
 
 def make_env_fn(instance_id):
     def _init():
-        return Monitor(ZeepkistEnv(instance_id=instance_id, use_curriculum=USE_CURRICULUM))
+        return Monitor(ZeepkistEnv(instance_id=instance_id, use_curriculum=False))
     return _init
 
 def train():
@@ -103,12 +87,14 @@ def train():
     parser.add_argument("--instances", type=int, default=1, help="Number of concurrent game replicas (default: 1)")
     args = parser.parse_args()
 
-    sys.stdout = Logger("zeepkist_training.log")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(script_dir, "..", "zeepkist_logs")
+    sys.stdout = Logger(os.path.join(script_dir, "zeepkist_training.log"))
     sys.stderr = sys.stdout
 
     SAVE_FREQ = 50_000 
-    model_path = "zeepkist_ai_model"
-    stats_path = "zeepkist_vec_normalize.pkl"
+    model_path = os.path.join(script_dir, "zeepkist_ai_model")
+    stats_path = os.path.join(script_dir, "zeepkist_vec_normalize.pkl")
 
     print("\n" + "="*50)
     print(f"New Training Session Started (Replicas: {args.instances})")
@@ -116,25 +102,21 @@ def train():
 
     if args.instances > 1:
         print(f"Creating parallel SubprocVecEnv across {args.instances} game instances...")
-        venv = SubprocVecEnv([make_env_fn(i) for i in range(args.instances)])
+        env = SubprocVecEnv([make_env_fn(i) for i in range(args.instances)])
     else:
-        venv = DummyVecEnv([make_env_fn(0)])
-    
-    env = None
+        env = DummyVecEnv([make_env_fn(0)])
+
+    # Clean up any stale VecNormalize pickle so it does not distort observations
     if os.path.exists(stats_path):
-        print("Loading existing normalization stats...")
-        try: env = VecNormalize.load(stats_path, venv)
-        except: os.remove(stats_path)
+        try: os.remove(stats_path)
+        except: pass
 
-    if env is None:
-        print("Creating new normalization stats...")
-        env = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=10.0)
-
-    ALGO = "SAC" # Change to "PPO" to train with PPO
-
-    # Standardized PPO hyperparameters for stability
-    target_n_steps = 16384 # Approx 3-4 minutes of driving
-    target_batch_size = 128
+    ALGO = "PPO" # PPO prevents off-policy Q-critic policy degeneration
+    
+    # Standardized PPO hyperparameters for stability across parallel environments
+    # Total batch per update = instances * target_n_steps = 2048
+    target_n_steps = max(256, 2048 // max(1, args.instances))
+    target_batch_size = 64
 
     # 2. Define the model
     model = None
@@ -142,9 +124,10 @@ def train():
         print(f"Loading existing {ALGO} model...")
         try:
             if ALGO == "SAC":
-                model = SAC.load(model_path, env=env, tensorboard_log="../zeepkist_logs")
+                model = SAC.load(model_path, env=env, tensorboard_log=log_dir)
+                model.learning_starts = 0  # Pretrained model: use policy immediately without random exploration
             else:
-                model = CustomPPO.load(model_path, env=env, tensorboard_log="../zeepkist_logs")
+                model = ZeepkistPPO.load(model_path, env=env, tensorboard_log=log_dir)
                 model.n_steps = target_n_steps
                 model.batch_size = target_batch_size
                 # Rebuild buffer to match new observation space and size
@@ -162,39 +145,52 @@ def train():
                 "MlpPolicy", env, verbose=1,
                 learning_rate=3e-4,
                 buffer_size=100_000,
-                learning_starts=1000,
+                learning_starts=0,
                 batch_size=256,
                 tau=0.005,
                 gamma=0.99,
                 ent_coef="auto",
-                tensorboard_log="../zeepkist_logs"
+                tensorboard_log=log_dir
             )
         else:
             print("Creating fresh PPO model...")
-            model = CustomPPO(
+            model = ZeepkistPPO(
                 "MlpPolicy", env, verbose=1,
                 learning_rate=3e-4, n_steps=target_n_steps, batch_size=target_batch_size,
                 n_epochs=10, gamma=0.99, gae_lambda=0.95, ent_coef=0.01,
-                tensorboard_log="../zeepkist_logs"
+                tensorboard_log=log_dir
             )
 
-    checkpoint_callback = CheckpointCallback(save_freq=SAVE_FREQ, save_path="./checkpoints/", name_prefix=f"zeep_{ALGO.lower()}")
+    checkpoint_callback = CheckpointCallback(save_freq=SAVE_FREQ, save_path=os.path.join(script_dir, "checkpoints"), name_prefix=f"zeep_{ALGO.lower()}")
+    dashboard_callback = TelemetryDashboardCallback(os.path.join(script_dir, "zeepkist_training.log"), check_freq=100)
 
     # 4. Start Learning
     try:
-        model.learn(total_timesteps=1_000_000_000, progress_bar=True, callback=[checkpoint_callback])
+        model.learn(total_timesteps=1_000_000_000, progress_bar=True, callback=[checkpoint_callback, dashboard_callback])
     except KeyboardInterrupt:
         print("\nInterrupt detected! Protecting save process from further interrupts...")
     finally:
         # --- SAVE PROTECTION ---
         # Ignore further Ctrl+C signals so we don't corrupt the model during the write
         import signal
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except Exception:
+            pass
         
         print(f"Final save to {model_path}...")
-        model.save(model_path)
-        env.save(stats_path)
-        env.close() # This now triggers zeep_env.save_time()
+        try:
+            model.save(model_path)
+            if hasattr(env, "save"):
+                env.save(stats_path)
+        except Exception as e:
+            print(f"Error saving model/stats: {e}")
+
+        try:
+            env.close() # This triggers zeep_env.save_time()
+        except Exception:
+            pass
+            
         print("Done. You can now safely close this window.")
 
 if __name__ == "__main__":

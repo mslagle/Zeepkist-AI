@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net472</TargetFramework>
@@ -47,21 +47,10 @@
     <Reference Include="Microsoft.CSharp" />
     <Reference Include="System.Net.Http" />
   </ItemGroup>
- <Target Name="CopyToZeepkist" AfterTargets="Build" Condition=" '$(Configuration)' == 'Debug'">
-    <Message Text="Creating mono debug edition of plugin" Importance="high" />
-    <Exec Command="&quot;C:\Program Files\Unity 2021.3.10f1\Editor\Data\MonoBleedingEdge\bin\mono.exe&quot; &quot;C:\Program Files\Unity 2021.3.10f1\Editor\Data\MonoBleedingEdge\lib\mono\4.5\pdb2mdb.exe&quot; $(ProjectName).dll" WorkingDirectory="$(TargetDir)" />
-
+  <Target Name="CopyToZeepkist" AfterTargets="Build" Condition=" '$(Configuration)' == 'Debug' Or '$(Configuration)' == 'Release'">
     <ItemGroup>
-      <OutputFiles Include="$(TargetDir)$(ProjectName).*;$(TargetDir)Microsoft*.dll;$(TargetDir)**\*.mp3;$(TargetDir)**\*.png" />
+      <OutputFiles Include="$(TargetDir)$(ProjectName).*;$(TargetDir)Microsoft*.dll;$(TargetDir)GraphQL*.dll;$(TargetDir)protobuf-net*.dll;$(TargetDir)EasyCompressor*.dll;$(TargetDir)System.Reactive*.dll;$(TargetDir)System.Threading.Tasks.Extensions*.dll;$(TargetDir)**\*.mp3;$(TargetDir)**\*.png" />
     </ItemGroup>
     <Copy SourceFiles="%(OutputFiles.Fullpath)" DestinationFolder="M:\SteamLibrary\steamapps\common\Zeepkist\BepInEx\plugins\ai" />
-  </Target>
-
-  <Target Name="CreatePackage" AfterTargets="Build" Condition=" '$(Configuration)' == 'Release'">
-    <Message Text="Packaging Plugin" Importance="high" />
-    <ItemGroup>
-      <OutputFiles Include="$(TargetDir)$(ProjectName).*;$(TargetDir)Microsoft*.dll;$(TargetDir)**\*.mp3;$(TargetDir)**\*.png" />
-    </ItemGroup>
-    <Copy SourceFiles="%(OutputFiles.Fullpath)" DestinationFolder="$(TargetDir)\package" />
   </Target>
 </Project>
