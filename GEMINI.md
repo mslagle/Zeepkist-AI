@@ -2,10 +2,10 @@
 
 ## Architecture
 - **Mod (C# BepInEx):** Direct input hooking via Harmony Prefix patches, telemetry streaming (UDP 9090+), ghost points TCP server (9092+), and In-Game Telemetry HUD (`OnGUI`).
-- **Environment (Python):** `gymnasium` environment (`ZeepkistEnv`) in `scripts/zeep_env.py` with multi-instance support.
+- **Environment (Python):** `gymnasium` environment (`ZeepkistEnv`) in `scripts/python/zeep_env.py` with multi-instance support.
 - **Training Pipeline:**
-  - **Behavioral Cloning (BC) Pre-trainer:** `scripts/pretrain_bc.py` for supervised offline pre-training on 50% median GTR ghosts (~60s).
-  - **Reinforcement Learning (SAC / CustomPPO):** `scripts/train.py` with `SubprocVecEnv` parallel rollout collection (`--instances N`).
+  - **Behavioral Cloning (BC) Pre-trainer:** `scripts/python/pretrain_bc.py` for supervised offline pre-training on 50% median GTR ghosts (~60s).
+  - **Reinforcement Learning (SAC / CustomPPO):** `scripts/python/train.py` with `SubprocVecEnv` parallel rollout collection (`--instances N`).
 - **Automated Launcher:** `scripts/launch_instances.ps1` for launching windowed instances with auto-track loading.
 
 ## Network Protocol
