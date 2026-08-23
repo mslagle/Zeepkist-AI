@@ -3,7 +3,7 @@ param (
     [string]$Track = "EZ01",
     [int]$WindowWidth = 960,
     [int]$WindowHeight = 540,
-    [int]$StaggerDelay = 30,
+    [int]$StaggerDelay = 10,
     [switch]$RebuildMod = $true
 )
 

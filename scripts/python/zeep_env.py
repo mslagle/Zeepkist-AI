@@ -454,7 +454,7 @@ class ZeepkistEnv(gym.Env):
                 print(msg)
                 append_training_log(msg)
                 terminated = True
-            elif not self.last_telemetry.get('IsSpawned', False):
+            elif not self.last_telemetry.get('IsSpawned', False) and self.steps_in_episode > 10:
                 termination_reason = self.last_telemetry.get('ResetReason', 'Unknown')
                 terminal_bonus = 5000.0 if termination_reason == "Finished" else -150.0
                 reward += terminal_bonus
@@ -525,38 +525,28 @@ class ZeepkistEnv(gym.Env):
         print(f"\n--- NEW RACE STARTING (Starting Grid | Furthest: {self.global_max_ghost_index}) ---")
         self._send_input(0.0, 0.0, 0.0, reset=True, spawn_index=spawn_index)
         
-        # 1. Wait for IsSpawned to become False (ensure reset processed)
-        self.telemetry_socket.settimeout(0.02)
-        start_wait_false = time.time()
-        while time.time() - start_wait_false < 3.0:
-            if self._receive_telemetry():
-                if not self.last_telemetry.get('IsSpawned', False):
-                    break
+        # Initial startup: wait for car to spawn and load ghost data once
+        if self.last_telemetry is None or self.ghost_frames is None:
+            self.telemetry_socket.settimeout(0.5)
+            start_wait_true = time.time()
+            while time.time() - start_wait_true < 30.0:
+                try:
+                    if self._receive_telemetry():
+                        if self.last_telemetry.get('IsSpawned', False):
+                            level = self.last_telemetry['LevelHash']
+                            if self.ghost_frames is None:
+                                self._send_input(0.0, 0.0, 0.0, request_ghost=True)
+                                if self._receive_points_from_mod(level):
+                                    break
+                            else: break
+                    time.sleep(0.01)
+                except KeyboardInterrupt:
+                    print("\nReset interrupted by user.")
+                    raise
             else:
-                # Timeout occurred, meaning no packets are coming (level is loading)
-                break
-        self.telemetry_socket.settimeout(0.5)
-
-        # 2. Wait for IsSpawned to become True (ensure car spawned)
-        start_wait_true = time.time()
-        while time.time() - start_wait_true < 30.0:
-            try:
-                if self._receive_telemetry():
-                    if self.last_telemetry.get('IsSpawned', False):
-                        level = self.last_telemetry['LevelHash']
-                        if self.ghost_frames is None:
-                            self._send_input(0.0, 0.0, 0.0, request_ghost=True)
-                            if self._receive_points_from_mod(level):
-                                break
-                        else: break
-                time.sleep(0.05)
-            except KeyboardInterrupt:
-                print("\nReset interrupted by user.")
-                raise
-        else:
-            print("Reset timed out after 30 seconds. Car may not be spawned.")
-            
-        # Flush telemetry socket to ensure first step() gets fresh data
+                print("Reset timed out after 30 seconds. Car may not be spawned.")
+                
+        # Flush socket so subsequent steps get fresh telemetry
         self.telemetry_socket.settimeout(0.0)
         try:
             while True: self.telemetry_socket.recv(8192)

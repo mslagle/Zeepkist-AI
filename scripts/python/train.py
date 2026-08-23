@@ -113,10 +113,9 @@ def train():
 
     ALGO = "PPO" # PPO prevents off-policy Q-critic policy degeneration
     
-    # Standardized PPO hyperparameters for stability across parallel environments
-    # Total batch per update = instances * target_n_steps = 2048
-    target_n_steps = max(256, 2048 // max(1, args.instances))
-    target_batch_size = 64
+    # Collect many full runs before each brain update (4096 steps ~ 8-10 complete laps per replica)
+    target_n_steps = 4096
+    target_batch_size = 128
 
     # 2. Define the model
     model = None
@@ -157,7 +156,7 @@ def train():
             model = ZeepkistPPO(
                 "MlpPolicy", env, verbose=1,
                 learning_rate=3e-4, n_steps=target_n_steps, batch_size=target_batch_size,
-                n_epochs=10, gamma=0.99, gae_lambda=0.95, ent_coef=0.01,
+                n_epochs=4, gamma=0.99, gae_lambda=0.95, ent_coef=0.01,
                 tensorboard_log=log_dir
             )
 
