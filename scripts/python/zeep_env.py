@@ -53,8 +53,8 @@ class ZeepkistEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation space: 35 Continuous values
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(35,), dtype=np.float32)
+        # Observation space: 47 Continuous values (4 multi-horizon lookaheads + path curvature + 5 road-aligned LIDAR beams)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(47,), dtype=np.float32)
 
         # Network setup
         self.telemetry_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -137,7 +137,21 @@ class ZeepkistEnv(gym.Env):
 
     def _receive_telemetry(self):
         try:
-            data, addr = self.telemetry_socket.recvfrom(8192)
+            data = None
+            try:
+                data, addr = self.telemetry_socket.recvfrom(8192)
+                self.telemetry_socket.setblocking(False)
+                while True:
+                    try:
+                        latest, _ = self.telemetry_socket.recvfrom(8192)
+                        if latest:
+                            data = latest
+                    except (BlockingIOError, socket.error):
+                        break
+            finally:
+                self.telemetry_socket.setblocking(True)
+                self.telemetry_socket.settimeout(0.5)
+
             if not data: return False
             
             ptr = 0
@@ -190,6 +204,12 @@ class ZeepkistEnv(gym.Env):
             t['LevelHash'] = read_string()
             t['ResetReason'] = read_string()
             
+            # 5-beam Road-Aligned LIDAR distances (meters)
+            try:
+                t['Lidar'] = [read_float(), read_float(), read_float(), read_float(), read_float()]
+            except Exception:
+                t['Lidar'] = [8.0, 8.0, 8.0, 8.0, 8.0]
+            
             self.last_telemetry = t
             
             if self.current_level_hash != t['LevelHash']:
@@ -226,7 +246,7 @@ class ZeepkistEnv(gym.Env):
         t = self.last_telemetry
         if not t or not t.get('IsSpawned', False):
             self.fallen_off = False
-            return np.zeros(35, dtype=np.float32)
+            return np.zeros(self.observation_space.shape[0], dtype=np.float32)
 
         car_pos = np.array([t['Position']['x'], t['Position']['y'], t['Position']['z']])
         car_quat = t['Rotation']
@@ -268,6 +288,16 @@ class ZeepkistEnv(gym.Env):
             gf = self.ghost_frames[self.last_ghost_index]
             dist_to_line = np.linalg.norm(np.array(gf['p']) - car_pos)
             
+            # Unannounced Respawn Detection (if car teleported back to start grid during background optimization)
+            dist_to_start = np.linalg.norm(np.array(self.ghost_frames[0]['p']) - car_pos)
+            if self.steps_in_episode > 20 and self.last_ghost_index > 40 and dist_to_start < 8.0:
+                self.unannounced_respawn = True
+                self.last_ghost_index = 0
+                gf = self.ghost_frames[0]
+                dist_to_line = dist_to_start
+            else:
+                self.unannounced_respawn = False
+
             # Failure Conditions: Only check veering after starting grid warmup (step > 30)
             if self.steps_in_episode > 30 and self.last_ghost_index > 5:
                 self.veered_off = dist_to_line > 15.0
@@ -282,11 +312,19 @@ class ZeepkistEnv(gym.Env):
             ghost_speed = gf['s']
             ghost_flags = [1.0 if gf['a'] else 0.0, 1.0 if gf['b'] else 0.0]
             
-            # Lookaheads (Responsive short ~0.25s and medium ~0.6s)
-            lh1_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 12)
-            lh2_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 30)
+            # Multi-Horizon Lookaheads (Near ~0.20s, Mid ~0.50s, Far ~1.10s, Horizon ~1.90s)
+            lh1_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 10)
+            lh2_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 25)
+            lh3_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 55)
+            lh4_idx = min(len(self.ghost_frames)-1, self.last_ghost_index + 95)
+            
             lookahead1 = self._rotate_to_local(np.array(self.ghost_frames[lh1_idx]['p']) - car_pos, car_quat)
             lookahead2 = self._rotate_to_local(np.array(self.ghost_frames[lh2_idx]['p']) - car_pos, car_quat)
+            lookahead3 = self._rotate_to_local(np.array(self.ghost_frames[lh3_idx]['p']) - car_pos, car_quat)
+            lookahead4 = self._rotate_to_local(np.array(self.ghost_frames[lh4_idx]['p']) - car_pos, car_quat)
+
+            # Chicane / Curvature delta (Lateral difference between Far and Near lookahead indicates S-curves)
+            curvature_delta = [float(lookahead3[0] - lookahead1[0])]
 
             # Road tangent direction along the track spline (curve guidance)
             tangent_world = np.array(self.ghost_frames[lh1_idx]['p']) - np.array(gf['p'])
@@ -299,29 +337,37 @@ class ZeepkistEnv(gym.Env):
             progress = self.last_ghost_index / len(self.ghost_frames)
         else:
             track_dir_local = self._rotate_to_local([t['CPDir']['x'], t['CPDir']['y'], t['CPDir']['z']], car_quat)
+            lookahead1 = np.zeros(3, dtype=np.float32)
+            lookahead2 = np.zeros(3, dtype=np.float32)
+            lookahead3 = np.zeros(3, dtype=np.float32)
+            lookahead4 = np.zeros(3, dtype=np.float32)
+            curvature_delta = [0.0]
 
         # 3. Environment Sensors
         ground_normal_local = self._rotate_to_local([t['GroundNormal']['x'], t['GroundNormal']['y'], t['GroundNormal']['z']], car_quat)
+        
+        # 4. Track-Spline Aligned LIDAR Sensor (5 Beams normalized 0.0 - 1.0, 8m max range)
+        lidar_normalized = np.array(t.get('Lidar', [8.0]*5), dtype=np.float32) / 8.0
         
         obs = np.concatenate([
             vel_local, ang_vel_local, [t['Speed']],
             rel_ghost_pos, rel_ghost_rot, [ghost_speed], ghost_flags,
             ground_normal_local, track_dir_local,
-            lookahead1, lookahead2,
+            lookahead1, lookahead2, lookahead3, lookahead4, curvature_delta,
+            lidar_normalized,
             [self.last_steering], [1.0 if t['IsSlipping'] else 0.0], [t['SurfaceFriction']],
             [progress], [1.0 if self.ghost_frames else 0.0],
-            [1.0 if t['IsGrounded'] else 0.0] # Groundedness
+            [1.0 if t['IsGrounded'] else 0.0] # Groundedness (Index 46)
         ]).astype(np.float32)
         
         return np.nan_to_num(obs)
 
     def _calculate_reward(self, obs, action):
-        # 0-2: VelLocal, 7-9: RelGhostPos, 17-19: GroundNormal, 20-22: CPDir
-        # Since we removed Rays (75 values), the new index of IsGrounded is 34.
+        # 0-2: VelLocal, 7-9: RelGhostPos, 17-19: GroundNormal, 20-22: CPDir, 46: IsGrounded
         vel_local = obs[0:3]
         speed = obs[6]
         rel_ghost_pos = obs[7:10]
-        is_grounded = obs[34] > 0.5
+        is_grounded = obs[46] > 0.5
         ghost_is_braking = obs[16] > 0.5
         
         # 0. TIME COST (Small step penalty so faster completion times earn higher cumulative return)
@@ -362,12 +408,12 @@ class ZeepkistEnv(gym.Env):
         if dist_to_path > 3.0:
             reward -= (dist_to_path - 3.0) * 0.5
         
-        # 4. MOMENTUM CONSERVATION & SMOOTHNESS
+        # 4. MOMENTUM CONSERVATION & SMOOTHNESS (Relaxed for agile chicane slalom swerves)
         steering = action[0]
-        reward -= abs(steering) * (speed / 100.0) * 0.03
+        reward -= abs(steering) * (speed / 100.0) * 0.02
         
         steering_change = abs(steering - self.last_steering)
-        reward -= (steering_change ** 2) * 1.0
+        reward -= (steering_change ** 2) * 0.1
         self.last_steering = steering
 
         # 5. BRAKING PENALTY (Discourage unnecessary braking on open track)
@@ -377,6 +423,11 @@ class ZeepkistEnv(gym.Env):
                 reward -= brake_input * 3.0
             else:
                 reward -= brake_input * 0.05
+
+        # 6. TRACK-SPLINE ALIGNED LIDAR BARRIER REPULSION (Soft avoidance penalty when nearing obstacles)
+        min_lidar = min(self.last_telemetry.get('Lidar', [8.0]*5))
+        if min_lidar < 2.0:
+            reward -= (2.0 - min_lidar) * 0.50
 
         return reward
 
@@ -446,7 +497,13 @@ class ZeepkistEnv(gym.Env):
 
         # Terminal conditions
         if not terminated:
-            if getattr(self, 'fallen_off', False):
+            if getattr(self, 'unannounced_respawn', False):
+                termination_reason = "Respawned / Reset"
+                msg = f"[RESET] Reason: {termination_reason} | Final Reward: {self.episode_reward:.2f}"
+                print(msg)
+                append_training_log(msg)
+                terminated = True
+            elif getattr(self, 'fallen_off', False):
                 termination_reason = "Veered off track (>15m from line)" if getattr(self, 'veered_off', False) else "Fell off track (>15m below line)"
                 reward -= 150.0
                 self.episode_reward += (-150.0)

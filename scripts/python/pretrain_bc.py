@@ -75,17 +75,25 @@ def extract_demonstrations(env, ghost_frames):
                 'CPDir': {'x': 0.0, 'y': 0.0, 'z': 1.0},
                 'CPRelPos': {'x': 0.0, 'y': 0.0, 'z': 0.0},
                 'LevelHash': 'BC_TRAIN',
-                'ResetReason': 'None'
+                'ResetReason': 'None',
+                'Lidar': [8.0, 8.0, 8.0, 8.0, 8.0]
             }
             env.last_ghost_index = i
             
             obs = env._get_obs()
             
-            # Pure Pursuit target steering from lookahead 1 (indices 23 and 25)
-            lh1_x = obs[23]
-            lh1_z = max(1.0, obs[25])
-            angle_to_lookahead = np.arctan2(lh1_x, lh1_z)
-            steer_target = float(np.clip(angle_to_lookahead * 2.8, -1.0, 1.0))
+            # Multi-Horizon Pure Pursuit target steering (combining near tracking with far slalom anticipation)
+            lh1_x, lh1_z = obs[23], max(1.0, obs[25])
+            lh2_x, lh2_z = obs[26], max(1.0, obs[28])
+            lh3_x, lh3_z = obs[29], max(1.0, obs[31])
+            
+            angle_near = np.arctan2(lh1_x, lh1_z)
+            angle_mid = np.arctan2(lh2_x, lh2_z)
+            angle_far = np.arctan2(lh3_x, lh3_z)
+            
+            # Blended steering angle: 60% near precision, 25% mid turn-in, 15% far chicane anticipation
+            blended_angle = angle_near * 0.60 + angle_mid * 0.25 + angle_far * 0.15
+            steer_target = float(np.clip(blended_angle * 2.8, -1.0, 1.0))
             
             observations.append(obs)
             actions.append([steer_target, brake_target, arms_target])

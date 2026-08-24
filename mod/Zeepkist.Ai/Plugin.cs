@@ -63,6 +63,8 @@ namespace Zeepkist.Ai
         private static string lastResetReason = "None";
         private static bool checkpointReached = false;
         private static CheckpointHomingVisualizer homingVisualizer = null;
+        private static LidarVisualizer lidarVisualizer = null;
+        public static ConfigEntry<bool> ShowLidarRays;
         private static bool isRoundActive = false;
         private static bool isRewardFrozen = false;
         private static float lastFrozenReward = 0f;
@@ -149,6 +151,7 @@ namespace Zeepkist.Ai
 
             ShowCpHomingLine = Config.Bind<bool>("Visuals", "Show CP Homing Line", true);
             CpHomingLineWidth = Config.Bind<float>("Visuals", "CP Homing Line Width", 0.20f);
+            ShowLidarRays = Config.Bind<bool>("Visuals", "Show Road-Aligned LIDAR Rays", true, "Renders visible road-aligned obstacle avoidance LIDAR beams");
 
             gtrClient = new GtrClient.GtrClient(Logger);
 
@@ -173,6 +176,10 @@ namespace Zeepkist.Ai
                 if (homingVisualizer == null) {
                     GameObject homingObj = new GameObject("AI_CheckpointHomingVisualizer");
                     homingVisualizer = homingObj.AddComponent<CheckpointHomingVisualizer>();
+                }
+                if (lidarVisualizer == null) {
+                    GameObject lidarObj = new GameObject("AI_LidarVisualizer");
+                    lidarVisualizer = lidarObj.AddComponent<LidarVisualizer>();
                 }
 
                 UnityMainThreadDispatcher.Instance().Enqueue(() => {
@@ -729,6 +736,45 @@ namespace Zeepkist.Ai
                         writer.Write(relCpPos.x); writer.Write(relCpPos.y); writer.Write(relCpPos.z);
 
                         writer.Write(currentLevelHash); writer.Write(lastResetReason);
+
+                        // --- TRACK-SPLINE ALIGNED LIDAR SENSORS (Always points down the driving line) ---
+                        Vector3 trackSplineForward = transform.forward;
+                        if (cachedFrames != null && cachedFrames.Count > 1) {
+                            int closestIdx = GetClosestGhostFrameIndex(transform.position);
+                            int targetIdx = Mathf.Min(cachedFrames.Count - 1, closestIdx + 4);
+                            if (targetIdx != closestIdx) {
+                                Vector3 splineTan = (cachedFrames[targetIdx].Position - cachedFrames[closestIdx].Position).normalized;
+                                if (splineTan.sqrMagnitude > 0.001f) trackSplineForward = splineTan;
+                            }
+                        }
+
+                        Vector3 fwdOnGround = Vector3.ProjectOnPlane(trackSplineForward, groundNormal).normalized;
+                        if (fwdOnGround.sqrMagnitude < 0.001f) fwdOnGround = trackSplineForward;
+                        Vector3 lidarOrigin = transform.position + groundNormal * 0.35f;
+
+                        // Compact beam angles (-16 to +16 deg) spanning 4.4m corridor at 8m max distance
+                        float[] lidarAngles = new float[] { -16f, -8f, 0f, 8f, 16f };
+                        Vector3[] lidarDirs = new Vector3[5];
+                        float[] lidarDists = new float[5];
+                        const float LidarMaxDist = 8.0f;
+                        int raycastMask = ~LayerMask.GetMask("Ignore Raycast");
+
+                        for (int r = 0; r < 5; r++) {
+                            Quaternion rot = Quaternion.AngleAxis(lidarAngles[r], groundNormal);
+                            Vector3 dir = rot * fwdOnGround;
+                            lidarDirs[r] = dir;
+                            if (Physics.Raycast(lidarOrigin, dir, out RaycastHit hit, LidarMaxDist, raycastMask, QueryTriggerInteraction.Ignore)) {
+                                lidarDists[r] = hit.distance;
+                            } else {
+                                lidarDists[r] = LidarMaxDist;
+                            }
+                            writer.Write(lidarDists[r]);
+                        }
+
+                        if (lidarVisualizer != null) {
+                            lidarVisualizer.UpdateBeams(lidarOrigin, lidarDirs, lidarDists, LidarMaxDist);
+                        }
+
                         checkpointReached = false;
                     } else {
                         writer.Write(Time.time);
@@ -745,6 +791,9 @@ namespace Zeepkist.Ai
                         writer.Write(0f); writer.Write(0f); writer.Write(1f); // CP Forward
                         writer.Write(0f); writer.Write(0f); writer.Write(0f); // CP Rel Pos
                         writer.Write(currentLevelHash); writer.Write(lastResetReason);
+                        for (int r = 0; r < 5; r++) {
+                            writer.Write(8.0f);
+                        }
                     }
                     byte[] bytes = ms.ToArray();
                     try { telemetryClient.Send(bytes, bytes.Length, telemetryEndPoint); } catch { }
@@ -1064,6 +1113,57 @@ namespace Zeepkist.Ai
             float width = Plugin.CpHomingLineWidth.Value;
             line.startWidth = width;
             line.endWidth = width;
+        }
+    }
+
+    public class LidarVisualizer : MonoBehaviour {
+        private LineRenderer[] lines;
+        private static readonly Color HitColor = new Color(1f, 0.2f, 0.2f, 0.95f);   // Bright Red on barrier detection
+        private static readonly Color ClearColor = new Color(0.1f, 1f, 0.4f, 0.45f); // Transparent Green on clear road
+
+        private void Awake() {
+            lines = new LineRenderer[5];
+            for (int i = 0; i < 5; i++) {
+                GameObject child = new GameObject($"LidarBeam_{i}");
+                child.transform.SetParent(this.transform);
+                LineRenderer lr = child.AddComponent<LineRenderer>();
+                lr.useWorldSpace = true;
+                lr.startWidth = 0.08f;
+                lr.endWidth = 0.08f;
+                lr.material = new Material(Shader.Find("Sprites/Default"));
+                lr.startColor = ClearColor;
+                lr.endColor = ClearColor;
+                lines[i] = lr;
+            }
+        }
+
+        public void UpdateBeams(Vector3 origin, Vector3[] rayDirs, float[] hitDists, float maxDist) {
+            if (lines == null || rayDirs == null) return;
+            bool enable = Plugin.EnableAi.Value && Plugin.ShowLidarRays.Value && Plugin.playerCar != null;
+            for (int i = 0; i < lines.Length; i++) {
+                if (lines[i] == null) continue;
+                if (!enable || i >= rayDirs.Length) {
+                    lines[i].enabled = false;
+                    continue;
+                }
+                lines[i].enabled = true;
+                lines[i].positionCount = 2;
+                lines[i].SetPosition(0, origin);
+                float d = (hitDists != null && i < hitDists.Length) ? hitDists[i] : maxDist;
+                Vector3 endPos = origin + rayDirs[i] * d;
+                lines[i].SetPosition(1, endPos);
+                Color c = d < (maxDist - 0.5f) ? HitColor : ClearColor;
+                lines[i].startColor = c;
+                lines[i].endColor = c;
+            }
+        }
+
+        private void Update() { 
+            if (!Plugin.EnableAi.Value || !Plugin.ShowLidarRays.Value || Plugin.playerCar == null) {
+                if (lines != null) {
+                    foreach (var l in lines) if (l != null) l.enabled = false;
+                }
+            }
         }
     }
 
